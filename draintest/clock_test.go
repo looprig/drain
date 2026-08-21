@@ -1,6 +1,8 @@
 package draintest_test
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -150,6 +152,11 @@ func TestFakeClockStopAfterFiringReturnsFalse(t *testing.T) {
 		}
 	})
 
+	// FireStopped is where the fake and time.Timer part company, deliberately:
+	// this Stop returns true and the callback is then forced to run anyway,
+	// where the real lost race is announced by Stop returning false. What must
+	// still hold is the part the coordinator depends on — a spent timer is spent
+	// — so the Stop after the forced firing is false.
 	t.Run("after FireStopped ran the callback", func(t *testing.T) {
 		t.Parallel()
 
@@ -296,20 +303,294 @@ func TestFakeClockConcurrentAdvanceAndAfterFunc(t *testing.T) {
 	wg.Wait()
 
 	// A single final advance from this goroutine settles every timer that the
-	// concurrent advances did not reach.
+	// concurrent advances did not reach. Only this advance may be reasoned
+	// about: the concurrent ones overtake each other, so the elapsed time they
+	// produced is a maximum and not a sum, and nothing here asserts on Now.
 	clock.Advance(time.Hour)
 
+	var won, lost int
 	for i := range armers {
 		if got := kept[i].get(); got != 1 {
 			t.Errorf("timer %d: callback ran %d times, want exactly 1", i, got)
 		}
 		got := stopped[i].get()
 		switch {
-		case stopOK[i] && got != 0:
-			t.Errorf("timer %d: callback ran %d times after Stop() reported true, want 0", i, got)
-		case !stopOK[i] && got != 1:
-			t.Errorf("timer %d: Stop() reported false but the callback ran %d times, want 1", i, got)
+		case stopOK[i]:
+			won++
+			if got != 0 {
+				t.Errorf("timer %d: callback ran %d times after Stop() reported true, want 0", i, got)
+			}
+		default:
+			lost++
+			if got != 1 {
+				t.Errorf("timer %d: Stop() reported false but the callback ran %d times, want 1", i, got)
+			}
 		}
+	}
+
+	// Which branch each Stop takes is up to the scheduler, so report the split.
+	// A run that lands entirely in one bucket still passes every assertion above
+	// while proving only half of what this test is for; say so rather than let
+	// it degrade quietly.
+	t.Logf("Stop() won %d of %d races and lost %d", won, armers, lost)
+	if won == 0 || lost == 0 {
+		t.Skipf("only one Stop branch was exercised (won %d, lost %d): this run proves half the invariant", won, lost)
+	}
+}
+
+// TestFakeClockFireStoppedConcurrent pins the invariant that made the lazy
+// fired-marking a bug: two concurrent FireStopped calls must partition the
+// stopped timers between them, never both run the same callback. Marking a
+// timer just before calling it — with the lock dropped for the call — let a
+// second caller re-snapshot everything the first had not reached yet.
+func TestFakeClockFireStoppedConcurrent(t *testing.T) {
+	t.Parallel()
+
+	const (
+		timers = 64
+		firers = 8
+	)
+
+	clock := draintest.NewClock(epoch)
+	fired := make([]*counter, timers)
+	for i := range timers {
+		fired[i] = &counter{}
+		timer := clock.AfterFunc(time.Duration(i+1)*time.Second, fired[i].inc)
+		if !timer.Stop() {
+			t.Fatalf("timer %d: Stop() = false, want true", i)
+		}
+	}
+
+	var (
+		wg     sync.WaitGroup
+		forced atomic.Int64
+	)
+	for range firers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			forced.Add(int64(clock.FireStopped()))
+		}()
+	}
+	wg.Wait()
+
+	// The returned counts are exact, so they partition the set: every timer is
+	// claimed by exactly one caller.
+	if got := forced.Load(); got != timers {
+		t.Errorf("FireStopped counts summed to %d, want %d", got, timers)
+	}
+	for i := range timers {
+		if got := fired[i].get(); got != 1 {
+			t.Errorf("timer %d: callback ran %d times, want exactly 1", i, got)
+		}
+	}
+}
+
+// TestFakeClockArmed covers the count that BlockUntil waits on. "Armed" is
+// specifically "waiting for its deadline": neither a fired timer nor a stopped
+// one is still going to happen.
+func TestFakeClockArmed(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		arm  func(c *draintest.Clock)
+		want int
+	}{
+		{"a fresh clock has none", func(*draintest.Clock) {}, 0},
+		{"one armed timer", func(c *draintest.Clock) { c.AfterFunc(time.Second, func() {}) }, 1},
+		{"several armed timers", func(c *draintest.Clock) {
+			for range 3 {
+				c.AfterFunc(time.Second, func() {})
+			}
+		}, 3},
+		{"a stopped timer is not armed", func(c *draintest.Clock) {
+			c.AfterFunc(time.Second, func() {}).Stop()
+		}, 0},
+		{"a fired timer is not armed", func(c *draintest.Clock) {
+			c.AfterFunc(time.Second, func() {})
+			c.Advance(time.Second)
+		}, 0},
+		{"only the unfired remainder counts", func(c *draintest.Clock) {
+			c.AfterFunc(time.Second, func() {})
+			c.AfterFunc(time.Hour, func() {})
+			c.AfterFunc(2*time.Hour, func() {})
+			c.Advance(time.Second)
+		}, 2},
+		{"a timer armed by a callback counts", func(c *draintest.Clock) {
+			c.AfterFunc(time.Second, func() { c.AfterFunc(time.Hour, func() {}) })
+			c.Advance(time.Second)
+		}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			clock := draintest.NewClock(epoch)
+			tc.arm(clock)
+			if got := clock.Armed(); got != tc.want {
+				t.Errorf("Armed() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFakeClockBlockUntilOrdersTheArm is the reason BlockUntil exists: without
+// it the advance can beat the arm, the timer is left waiting on a deadline the
+// clock has already passed, and the test hangs to its own timeout rather than
+// failing.
+func TestFakeClockBlockUntilOrdersTheArm(t *testing.T) {
+	t.Parallel()
+
+	t.Run("returns immediately when enough timers are already armed", func(t *testing.T) {
+		t.Parallel()
+
+		clock := draintest.NewClock(epoch)
+		clock.BlockUntil(0) // never blocks: zero timers is always satisfied
+
+		clock.AfterFunc(time.Second, func() {})
+		clock.BlockUntil(1)
+	})
+
+	t.Run("waits for a timer armed on another goroutine", func(t *testing.T) {
+		t.Parallel()
+
+		clock := draintest.NewClock(epoch)
+		var fired counter
+
+		armed := make(chan struct{})
+		go func() {
+			<-armed
+			clock.AfterFunc(time.Second, fired.inc)
+		}()
+
+		close(armed)
+		clock.BlockUntil(1)
+		clock.Advance(time.Second)
+
+		if got := fired.get(); got != 1 {
+			t.Errorf("callback ran %d times, want 1 — the advance beat the arm", got)
+		}
+	})
+
+	t.Run("counts arms across goroutines", func(t *testing.T) {
+		t.Parallel()
+
+		clock := draintest.NewClock(epoch)
+		var fired counter
+		for range 4 {
+			go clock.AfterFunc(time.Second, fired.inc)
+		}
+
+		clock.BlockUntil(4)
+		if got := clock.Armed(); got < 4 {
+			t.Fatalf("Armed() = %d after BlockUntil(4), want at least 4", got)
+		}
+		clock.Advance(time.Second)
+		if got := fired.get(); got != 4 {
+			t.Errorf("callbacks ran %d times, want 4", got)
+		}
+	})
+
+	t.Run("a stopped timer does not satisfy the wait", func(t *testing.T) {
+		t.Parallel()
+
+		clock := draintest.NewClock(epoch)
+		clock.AfterFunc(time.Second, func() {}).Stop()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if err := clock.BlockUntilContext(ctx, 1); !errors.Is(err, context.Canceled) {
+			t.Errorf("BlockUntilContext with only a stopped timer = %v, want context.Canceled", err)
+		}
+	})
+}
+
+// TestFakeClockBlockUntilContextRespectsCancellation covers the bounded variant:
+// a test that would rather fail in milliseconds than hang to the binary's
+// -timeout gets an error instead of a wait.
+func TestFakeClockBlockUntilContextRespectsCancellation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nothing armed", func(t *testing.T) {
+		t.Parallel()
+
+		clock := draintest.NewClock(epoch)
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		if err := clock.BlockUntilContext(ctx, 1); !errors.Is(err, context.Canceled) {
+			t.Errorf("BlockUntilContext() = %v, want context.Canceled", err)
+		}
+	})
+
+	t.Run("cancelled while waiting", func(t *testing.T) {
+		t.Parallel()
+
+		clock := draintest.NewClock(epoch)
+		ctx, cancel := context.WithCancel(t.Context())
+		go cancel()
+
+		if err := clock.BlockUntilContext(ctx, 1); !errors.Is(err, context.Canceled) {
+			t.Errorf("BlockUntilContext() = %v, want context.Canceled", err)
+		}
+	})
+
+	t.Run("already satisfied ignores a done context", func(t *testing.T) {
+		t.Parallel()
+
+		clock := draintest.NewClock(epoch)
+		clock.AfterFunc(time.Second, func() {})
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if err := clock.BlockUntilContext(ctx, 1); err != nil {
+			t.Errorf("BlockUntilContext() = %v, want nil — the condition already held", err)
+		}
+	})
+}
+
+// TestFakeClockPrunesFiredTimers pins the compaction that keeps a coordinator's
+// timer churn linear. It is invisible through the drain.Clock contract by
+// design, so the observable claims are the ones a prune could plausibly break:
+// a fired timer stays spent, and a stopped one survives to be forced.
+func TestFakeClockPrunesFiredTimers(t *testing.T) {
+	t.Parallel()
+
+	clock := draintest.NewClock(epoch)
+	var (
+		churn  counter
+		forced counter
+	)
+
+	// A coordinator re-arming an idle timer on every hold transition: arm, fire,
+	// arm, stop, repeat. Only the fired half is prunable.
+	for range 50 {
+		clock.AfterFunc(time.Millisecond, churn.inc)
+		clock.Advance(time.Millisecond)
+		clock.AfterFunc(time.Hour, forced.inc).Stop()
+	}
+
+	if got := churn.get(); got != 50 {
+		t.Errorf("armed-and-fired callbacks ran %d times, want 50", got)
+	}
+	if got := clock.Armed(); got != 0 {
+		t.Errorf("Armed() = %d after every timer fired or stopped, want 0", got)
+	}
+	// The stopped timers were kept, which is the half of the prune that matters:
+	// forcing them is what FireStopped is for.
+	if got := clock.FireStopped(); got != 50 {
+		t.Errorf("FireStopped() = %d, want 50 — stopped timers must survive the prune", got)
+	}
+	if got := forced.get(); got != 50 {
+		t.Errorf("forced callbacks ran %d times, want 50", got)
+	}
+	// Nothing is left to fire or force, in either direction.
+	if got := clock.FireStopped(); got != 0 {
+		t.Errorf("second FireStopped() = %d, want 0", got)
+	}
+	clock.Advance(2 * time.Hour)
+	if got, want := churn.get()+forced.get(), int64(100); got != want {
+		t.Errorf("callbacks ran %d times in total after a final advance, want %d", got, want)
 	}
 }
 

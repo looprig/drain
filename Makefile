@@ -1,5 +1,3 @@
-.PHONY: test fmt fmt-check vet staticcheck gosec vuln secure check
-
 test:
 	GOWORK=off go test -race ./...
 
@@ -13,37 +11,14 @@ fmt-check:
 vet:
 	GOWORK=off go vet ./...
 
-# staticcheck, gosec, and govulncheck are NOT module dependencies — CLAUDE.md
-# forbids adding anything beyond stdlib to go.mod — so each is invoked as an
-# external binary resolved from PATH or GOPATH/bin. If neither has it, the
-# target warns and skips so `make secure` stays green where the tool is not
-# installed.
-
-staticcheck:
-	@STATICCHECK=$$(command -v staticcheck || echo "$$(go env GOPATH)/bin/staticcheck"); \
-	if [ -x "$$STATICCHECK" ]; then \
-		echo "staticcheck: $$STATICCHECK"; GOWORK=off "$$STATICCHECK" ./...; \
-	else \
-		echo "staticcheck not installed; skipping (go install honnef.co/go/tools/cmd/staticcheck@latest)"; \
-	fi
-
-gosec:
-	@GOSEC=$$(command -v gosec || echo "$$(go env GOPATH)/bin/gosec"); \
-	if [ -x "$$GOSEC" ]; then \
-		echo "gosec: $$GOSEC"; GOWORK=off "$$GOSEC" -quiet ./...; \
-	else \
-		echo "gosec not installed; skipping (go install github.com/securego/gosec/v2/cmd/gosec@latest)"; \
-	fi
-
-vuln:
-	@GOVULNCHECK=$$(command -v govulncheck || echo "$$(go env GOPATH)/bin/govulncheck"); \
-	if [ -x "$$GOVULNCHECK" ]; then \
-		echo "govulncheck: $$GOVULNCHECK"; GOWORK=off "$$GOVULNCHECK" ./...; \
-	else \
-		echo "govulncheck not installed; skipping (go install golang.org/x/vuln/cmd/govulncheck@latest)"; \
-	fi
-
-secure: fmt-check vet staticcheck gosec vuln
+# `secure` is an alias for the security-relevant half of `check`, not a second
+# implementation of it. It used to be one: PATH-resolved staticcheck/gosec/
+# govulncheck targets that printed "not installed; skipping" and exited 0, so on
+# a machine with none of the three installed `make secure` was green while
+# having checked nothing at all. A security target that passes by finding no
+# tools is worse than no target. Both surfaces now run the same pinned versions
+# through `go run`, which adds nothing to go.mod.
+secure: fmt-check vet check-staticcheck check-gosec check-vuln
 
 # --- standardized check surface -------------------------------------------
 # One target, the same set of checks, in every module. CI calls exactly this,
@@ -77,4 +52,4 @@ build:
 
 check: fmt-check vet check-staticcheck check-gosec check-vuln test build
 
-.PHONY: check check-staticcheck check-gosec check-vuln fmt fmt-check vet test build
+.PHONY: build check check-gosec check-staticcheck check-vuln fmt fmt-check secure test vet

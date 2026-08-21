@@ -60,25 +60,28 @@ repository.
 Run these before pushing. CI runs the same.
 
 ```sh
-make fmt          # gofmt the whole module in place
-make fmt-check    # verify gofmt cleanliness without writing
-make vet          # go vet
-make test         # go test -race ./...           (always -race)
-make staticcheck  # staticcheck ./...
-make gosec        # gosec security scan
-make vuln         # govulncheck ./...
-make secure       # fmt-check + vet + staticcheck + gosec + vuln
-make check        # the full pre-commit gate (all of the above + build)
+make fmt               # gofmt the whole module in place
+make fmt-check         # verify gofmt cleanliness without writing
+make vet               # go vet
+make test              # go test -race ./...           (always -race)
+make check-staticcheck # staticcheck ./...             (pinned version)
+make check-gosec       # gosec security scan          (pinned version)
+make check-vuln        # go mod verify + govulncheck ./...
+make secure            # fmt-check + vet + the three above
+make check             # the full pre-commit gate (all of the above + build)
 ```
 
 `staticcheck`, `gosec`, and `govulncheck` are **not** module dependencies —
-they are resolved from `PATH` (falling back to `$(go env GOPATH)/bin`) at
-`make` time, exactly because of the no-third-party-dependencies rule above.
-Adding them via `go get -tool` or a `require`/`tool` directive would put an
-external package in `go.mod`, which this module does not permit under any
-circumstance. If a target's binary isn't installed, the target prints an
-install hint and skips gracefully rather than failing the build — install
-what you need locally to get full coverage before sending a PR.
+each runs at a pinned version through `go run`, exactly because of the
+no-third-party-dependencies rule above. Adding them via `go get -tool` or a
+`require`/`tool` directive would put an external package in `go.mod`, which
+this module does not permit under any circumstance.
+
+There is deliberately no PATH-resolved variant of these targets any more. The
+earlier one skipped with an install hint when the binary was missing and exited
+0, so `make secure` was green on a machine with none of the three installed —
+a security gate that passes by finding no tools. `secure` and `check` now run
+the same pinned commands, and a missing tool is a download, not a skip.
 
 Every Go command in the Makefile runs with `GOWORK=off` so the parent
 `go.work` at the workspace root never captures this module.

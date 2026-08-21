@@ -8,6 +8,16 @@
 // root wiring a coordinator to its readiness probe and its work needs to test
 // that wiring, and it cannot sleep for the grace period to do it.
 //
+// Clock.BlockUntil is how a test orders the code under test arming its timer
+// against the test advancing the clock; skipping it is the standard way to write
+// a shutdown test that hangs. For a test inside drain, testing/synctest is a
+// good alternative — synctest.Wait blocks until every goroutine in the bubble is
+// durably blocked, which orders the arm just as well and needs no cooperation
+// from the clock. It is not what this package is built around because draintest
+// exists for drain's consumers, and running a consumer's own shutdown wiring
+// inside synctest.Test is a constraint on their code that this module has no
+// standing to impose.
+//
 // Like drain itself, this package depends on the Go standard library and
 // nothing else.
 package draintest

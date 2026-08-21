@@ -10,8 +10,9 @@ outside the Go standard library, and it must stay that way.
   is insufficient. Do not `go get` anything. `go.mod` carries the module line and the Go
   version and nothing else — there is no `require` block, now or ever. If a task seems to
   need an external package, the task is wrong for this module.
-  (`make secure`'s staticcheck/gosec/govulncheck are PATH-resolved dev-tool binaries, not
-  go.mod dependencies — this does not contradict the rule above.)
+  (`make check`'s staticcheck/gosec/govulncheck run at pinned versions through `go run`,
+  as dev-tool binaries rather than go.mod dependencies — this does not contradict the
+  rule above.)
 
 ## Scope
 
