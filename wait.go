@@ -54,6 +54,12 @@ func (c *Coordinator) Wait(ctx context.Context) (Outcome, error) {
 		return Outcome{}, ErrAlreadyRunning
 	}
 
+	// The idle clock's epoch is here, not New, and not Begin: a coordinator
+	// that has been constructed but never waited on is a process that has not
+	// started serving, and killing it for being idle is the cold-start
+	// self-kill loop. See idle.go.
+	c.startIdle()
+
 	// Phase 1, quiesce. The sequence is started by Begin, from wherever the
 	// process decides to drain — a signal handler, the idle timer, a shutdown
 	// path — and it runs here, on Wait's goroutine, because none of those is a

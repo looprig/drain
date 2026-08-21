@@ -264,6 +264,21 @@ func (r *rig) armsInWait(n int) {
 	r.waitTimers = n
 }
 
+// armsIdle declares how many idle timers are armed at the next reach(phaseIdle)
+// — one, or none. It defaults to one for a rig with an idle timeout, which is
+// the state at Wait entry with nothing outstanding.
+//
+// A test that enters Wait already holding something says armsIdle(0): the idle
+// timer arms at Wait entry only if the total is already zero, and otherwise on a
+// nonzero→zero transition, and the startup-hold pattern is precisely the case
+// where neither has happened yet. It is a knob of its own rather than part of
+// waitTimers because the idle timer is the one timer that arms and disarms
+// repeatedly WITHIN a test, as holds come and go.
+func (r *rig) armsIdle(n int) {
+	r.t.Helper()
+	r.idleTimers = n
+}
+
 // start runs Wait on its own goroutine and keeps its return for result.
 func (r *rig) start(ctx context.Context) {
 	go func() {

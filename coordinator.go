@@ -58,6 +58,16 @@ type Coordinator struct {
 	// are decisions made under this lock on every release.
 	total int
 
+	// generation is bumped on every zero→nonzero transition of the total, and
+	// idleTimer is the idle timer currently armed, if any. Together they are
+	// the whole of the idle race fix — see idle.go, which owns the mechanism
+	// and the reasoning. idleActive records that Wait has been entered, which
+	// is the idle clock's epoch: a coordinator that has been constructed but
+	// not yet waited on never arms.
+	generation uint64
+	idleTimer  Timer
+	idleActive bool
+
 	// admissionOpen reports whether Acquire still grants. It is NOT the draining
 	// flag: for CauseSignal the coordinator is draining while admission stays
 	// open through the settle window, because the requests already routed here
@@ -297,6 +307,19 @@ func (c *Coordinator) admit(r Reason) bool {
 	if !c.admissionOpen {
 		return false
 	}
+
+	// The zero→nonzero transition, and the reason this section is one section.
+	// The generation bump and the increment that causes it are the same fact;
+	// an idle callback that could observe a nonzero total under the generation
+	// it was armed with would be a coordinator that kills a process the instant
+	// after it accepted work. Stopping the timer is only an optimization —
+	// Timer.Stop returns false once the callback is in flight, which is exactly
+	// the race the generation exists to close.
+	if c.total == 0 {
+		c.generation++
+		c.stopIdleLocked()
+	}
+
 	c.holds[r]++
 	c.total++
 	return true
@@ -320,6 +343,13 @@ func (c *Coordinator) releaseHold(r Reason) {
 		// a map that only ever grew would keep every reason the process has
 		// ever used alive for the life of the coordinator.
 		delete(c.holds, r)
+	}
+
+	// The nonzero→zero transition. A process that has just finished its last
+	// piece of work is the one the idle timeout is about, and this is the only
+	// place that transition happens.
+	if c.total == 0 {
+		c.armIdleLocked()
 	}
 
 	c.settleIfQuietLocked()
@@ -431,10 +461,20 @@ func (c *Coordinator) Begin(cause Cause) {
 // observed the admission flag of a drain whose cause had not been recorded yet
 // would be reading a state the coordinator was never in.
 func (c *Coordinator) begin(cause Cause) bool {
-	cause = normalizeCause(cause)
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.beginLocked(cause)
+}
+
+// beginLocked is begin with the lock already held. The caller must hold c.mu.
+//
+// It exists for the idle timer, and the split is the difference between a
+// correct idle path and a racy one: the idle callback has to re-validate the
+// counters and start the sequence WITHOUT releasing the lock in between, or a
+// hold granted in that gap is a hold on a process that has just decided to kill
+// itself. Every other caller wants begin.
+func (c *Coordinator) beginLocked(cause Cause) bool {
+	cause = normalizeCause(cause)
 
 	if c.draining {
 		return false
@@ -459,6 +499,13 @@ func (c *Coordinator) begin(cause Cause) bool {
 	if cause != CauseSignal {
 		c.admissionOpen = false
 	}
+
+	// The sequence has started, so there is nothing left for the idle timer to
+	// decide. Disarming it here is tidiness rather than correctness — its
+	// callback would find c.draining set and no-op — but a timer left armed for
+	// a ten-minute idle timeout is a timer the runtime keeps alive for ten
+	// minutes after the process has already decided to exit.
+	c.stopIdleLocked()
 
 	// Released last, so a Wait woken by it observes a fully recorded sequence.
 	close(c.begun)

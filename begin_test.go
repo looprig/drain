@@ -21,6 +21,22 @@ func recordedCause(c *Coordinator) Cause {
 }
 
 // admits reports whether Acquire still grants, without leaving a hold behind.
+//
+// It goes through the real Acquire rather than reading c.admissionOpen under the
+// lock, and that is deliberate: Acquire's ok is the module's only admission
+// authority, and a probe that read the flag directly would stop testing the path
+// every consumer actually takes — including that the check and the increment are
+// one critical section, which is the invariant the concurrent case here exists
+// for.
+//
+// It is not free, though, and the cost is worth knowing before it bites. The
+// probe hold is a real zero→nonzero→zero round trip: it bumps the idle
+// generation and, on a coordinator that has entered Wait with an idle timeout
+// configured, arms an idle timer on the way back down. No case in this file does
+// either — every coordinator here is constructed and driven without Wait, so
+// idleActive is false and nothing arms — but a future case that combines
+// WithIdleTimeout with a running Wait must not use admits to probe. It would be
+// perturbing the state it was measuring.
 func admits(c *Coordinator) bool {
 	release, ok := c.Acquire("probe")
 	release()
