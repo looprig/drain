@@ -6,6 +6,7 @@ import (
 	"maps"
 	"os"
 	"slices"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -31,6 +32,42 @@ type Coordinator struct {
 	// everything the options set.
 	gracePeriod time.Duration
 	cfg         config
+
+	// mu guards the four fields below as ONE critical section, and the grouping
+	// is load-bearing rather than tidy. A mutex that guarded "only the counters"
+	// admits this interleaving: Acquire reads admission as open, the sequence
+	// closes admission and snapshots the counters as empty, Acquire then
+	// increments and returns ok == true — a hold that is never waited for and
+	// never reported. So Acquire's admission check and its increment are one
+	// critical section, as closing admission and snapshotting the outstanding
+	// reasons will be.
+	//
+	// No user callback ever runs while this is held. That is what lets an owner
+	// call release() from inside OnDeadline, which is the expected shape of
+	// abandonment, without deadlocking against the coordinator.
+	mu sync.Mutex
+
+	// holds counts outstanding holds per reason. A reason is deleted when its
+	// count reaches zero, so the map never accumulates keys for work that
+	// finished and len(holds) == 0 means exactly "nothing outstanding".
+	holds map[Reason]int
+
+	// total is the sum of holds. It is kept alongside rather than summed on
+	// demand because the wait phase's exit condition is "the total reached zero"
+	// and the idle timer's arming is a transition of this number, both of which
+	// are decisions made under this lock on every release.
+	total int
+
+	// admissionOpen reports whether Acquire still grants. It is NOT the draining
+	// flag: for CauseSignal the coordinator is draining while admission stays
+	// open through the settle window, because the requests already routed here
+	// when the signal arrived still have to land. The two separate at the settle
+	// boundary.
+	admissionOpen bool
+
+	// draining reports whether the sequence has begun. It is written once, by
+	// the Begin that transitions it from false to true.
+	draining bool
 }
 
 // New returns a Coordinator whose sequence is bounded by gracePeriod, measured
@@ -60,7 +97,12 @@ func New(gracePeriod time.Duration, opts ...Option) (*Coordinator, error) {
 	// from one []Option already have separate maps and nothing outside New ever
 	// held a reference to this one. TestNewDoesNotShareStateAcrossCoordinators
 	// pins that, so a future option that took a caller's map fails there.
-	return &Coordinator{gracePeriod: gracePeriod, cfg: cfg}, nil
+	return &Coordinator{
+		gracePeriod:   gracePeriod,
+		cfg:           cfg,
+		holds:         make(map[Reason]int),
+		admissionOpen: true,
+	}, nil
 }
 
 // validate is New's single validation pass. The grace period is checked first
@@ -125,4 +167,124 @@ func validateSignals(sigs []os.Signal) error {
 		}
 	}
 	return nil
+}
+
+// noopRelease is the release returned by a refused Acquire. It is a package
+// value rather than a fresh closure per refusal because every refusal wants the
+// same nothing, and because a shared inert function makes it obvious that a
+// refused Acquire took no state with it.
+//
+// Returning this instead of nil is the module's fail-secure default: the shape
+// every consumer writes is
+//
+//	release, ok := c.Acquire(r)
+//	defer release()
+//
+// and a nil release would turn "we are shutting down" into a panic on the way
+// out — a shutdown coordinator crashing the process it was asked to retire
+// gracefully.
+func noopRelease() {}
+
+// Acquire registers a hold for reason r and reports whether it was granted. ok
+// is false once admission has closed — at Begin for the idle, explicit, and
+// context causes; at the settle boundary for a signal — and forever after the
+// sequence completes.
+//
+// release is never nil. When ok is false it is a no-op, so
+//
+//	release, ok := c.Acquire(r)
+//	defer release()
+//
+// is always safe. release is idempotent per returned closure, not per reason:
+// each Acquire yields its own once-guarded release, and calling one twice
+// decrements once. release remains valid after Wait returns, where it still
+// decrements so Holds stays truthful for a final metrics scrape, and it is safe
+// to call from inside an OnDeadline callback — that is the expected shape of
+// abandonment, where the owner interrupts work whose deferred release then runs
+// on the callback's stack.
+//
+// Acquire's ok is the only admission authority. Draining is advisory.
+func (c *Coordinator) Acquire(r Reason) (release func(), ok bool) {
+	c.mu.Lock()
+	if !c.admissionOpen {
+		c.mu.Unlock()
+		return noopRelease, false
+	}
+	c.holds[r]++
+	c.total++
+	c.mu.Unlock()
+
+	// One sync.Once per returned closure, never one per reason: two holds on one
+	// reason are two counts and two independent releases, so a per-reason guard
+	// would let the first release swallow the second hold's count and strand the
+	// coordinator waiting for work that had finished.
+	var once sync.Once
+	return func() { once.Do(func() { c.releaseHold(r) }) }, true
+}
+
+// releaseHold decrements one hold of reason r. It is only ever reached through a
+// once-guarded closure, so it cannot be called more times than the reason was
+// acquired and the counters cannot go negative.
+//
+// It takes c.mu and no other lock, which is the whole of the "release never
+// takes a lock a callback might already hold" contract: c.mu is the
+// coordinator's only lock and no user callback ever runs under it.
+func (c *Coordinator) releaseHold(r Reason) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.total--
+	if c.holds[r]--; c.holds[r] <= 0 {
+		// Deleted rather than left at zero so that the map is the set of
+		// reasons actually outstanding. Holds omits zero counts either way, but
+		// a map that only ever grew would keep every reason the process has
+		// ever used alive for the life of the coordinator.
+		delete(c.holds, r)
+	}
+}
+
+// Draining reports whether the sequence has begun. It is advisory — suitable for
+// a readiness probe or a log line. Consulting it before Acquire is a TOCTOU
+// race; call Acquire and check ok.
+func (c *Coordinator) Draining() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.draining
+}
+
+// Holds returns a snapshot copy of the outstanding hold count per reason,
+// omitting reasons at zero. The returned map is never the coordinator's own.
+// This is a liveness signal ("can I exit"), not an occupancy signal ("how full
+// am I") — see the module's non-goals.
+//
+// Holds returns nil when no holds are outstanding; it never returns an empty
+// non-nil map, matching Outcome's map policy.
+func (c *Coordinator) Holds() map[Reason]int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.holdsLocked()
+}
+
+// holdsLocked snapshots the counters. The caller must hold c.mu.
+//
+// The zero-count filter is redundant against releaseHold's delete and is kept
+// anyway: it makes the omit-zero guarantee a property of the snapshot itself
+// rather than a consequence of a rule enforced somewhere else, so a later
+// change to how counters are retired cannot leak a zero to a caller.
+func (c *Coordinator) holdsLocked() map[Reason]int {
+	if c.total == 0 {
+		// nil, never an empty non-nil map: maps.Clone of an empty map returns
+		// one, which would let m == nil and len(m) == 0 disagree for a caller.
+		return nil
+	}
+	snapshot := make(map[Reason]int, len(c.holds))
+	for r, count := range c.holds {
+		if count > 0 {
+			snapshot[r] = count
+		}
+	}
+	if len(snapshot) == 0 {
+		return nil
+	}
+	return snapshot
 }
