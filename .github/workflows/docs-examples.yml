@@ -1,0 +1,24 @@
+name: Documentation examples
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  docs-examples:
+    runs-on: ubuntu-latest
+    env:
+      GOCACHE: /tmp/looprig-drain-docs-gocache
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Run repository checks
+        run: GOWORK=off make check
+      - name: Run standalone race suite and examples
+        run: GOWORK=off go test -race ./...
