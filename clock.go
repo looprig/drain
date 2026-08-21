@@ -28,6 +28,23 @@ type Timer interface {
 	Stop() bool
 }
 
+// systemClock is the production Clock: the time package itself. It carries no
+// state, so it is a value rather than a pointer and every Coordinator shares
+// one. A coordinator constructed without WithClock gets this.
+type systemClock struct{}
+
+// Now reports the current wall-clock time.
+func (systemClock) Now() time.Time { return time.Now() }
+
+// AfterFunc arms f on the runtime timer. A non-positive d fires it almost
+// immediately, which is where the real clock and a fake part company: a fake
+// cannot run a callback the test did not ask for, so code that must act on an
+// already-elapsed deadline dispatches it directly rather than arming a timer.
+func (systemClock) AfterFunc(d time.Duration, f func()) Timer { return time.AfterFunc(d, f) }
+
 // *time.Timer satisfies Timer, so a production Clock returns time.AfterFunc's
 // result directly with no adapter.
-var _ Timer = (*time.Timer)(nil)
+var (
+	_ Timer = (*time.Timer)(nil)
+	_ Clock = systemClock{}
+)

@@ -11,24 +11,34 @@ import (
 // code, not a description of current behaviour:
 //
 //   - Every Error() is prefixed "drain: " and names its subject.
-//   - When an Error() renders a string subject — a field name today, a Reason
-//     when one is ever rendered — it quotes it with strconv.Quote, so an
-//     untrusted value cannot inject newlines or control bytes into a log line.
-//     No Error() in this package renders a Reason yet; the rule binds the one
-//     that first does.
+//   - When an Error() renders a string subject — a field name, or a Reason — it
+//     quotes it with strconv.Quote, so a value cannot inject newlines or control
+//     bytes into a log line. A Reason is the one genuinely caller-supplied
+//     string in the module, which is why InvalidPolicyError carries it as a
+//     field and renders it through that single quoted path rather than letting
+//     each construction site format it.
 
 // InvalidPolicyError reports a coordinator policy that cannot be honoured. It is
 // returned only by New, which is the single validation point: options record
 // intent and never silently drop a bad value. Field names the offending
 // parameter or option and Err describes what is wrong with it (and may be nil
 // when the field name says it all).
+//
+// Reason identifies which reason a reason-scoped option — WithDeadline — was
+// misconfigured for, and is empty for a failure not scoped to one. Field alone
+// is ambiguous the moment a caller passes two WithDeadline options, which is the
+// normal case.
 type InvalidPolicyError struct {
-	Field string
-	Err   error
+	Field  string
+	Reason Reason
+	Err    error
 }
 
 func (e *InvalidPolicyError) Error() string {
 	msg := "drain: invalid policy for " + strconv.Quote(e.Field)
+	if e.Reason != "" {
+		msg += ", reason " + strconv.Quote(string(e.Reason))
+	}
 	if e.Err != nil {
 		msg += ": " + e.Err.Error()
 	}

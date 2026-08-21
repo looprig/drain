@@ -84,6 +84,36 @@ func TestInvalidPolicyErrorMessage(t *testing.T) {
 			&drain.InvalidPolicyError{Field: "line\none\nline two"},
 			`drain: invalid policy for "line\none\nline two"`,
 		},
+		{
+			// Field alone cannot say which of two WithDeadline options was
+			// wrong, so a reason-scoped failure names its reason.
+			"field and reason",
+			&drain.InvalidPolicyError{Field: "deadline", Reason: "harness/pending_gate"},
+			`drain: invalid policy for "deadline", reason "harness/pending_gate"`,
+		},
+		{
+			"field, reason, and cause",
+			&drain.InvalidPolicyError{
+				Field:  "deadline",
+				Reason: "harness/active_turn",
+				Err:    errors.New("must not exceed the grace period"),
+			},
+			`drain: invalid policy for "deadline", reason "harness/active_turn": must not exceed the grace period`,
+		},
+		{
+			// The empty Reason is ReasonUnspecified as much as it is "no reason",
+			// so it renders as neither: a failure that named reason "" would read
+			// as a bug rather than as the unspecified reason.
+			"empty reason is omitted",
+			&drain.InvalidPolicyError{Field: "deadline", Reason: drain.ReasonUnspecified},
+			`drain: invalid policy for "deadline"`,
+		},
+		{
+			// A Reason is the one genuinely caller-supplied string in the module.
+			"reason needing quoting",
+			&drain.InvalidPolicyError{Field: "deadline", Reason: "a\tb\nc"},
+			`drain: invalid policy for "deadline", reason "a\tb\nc"`,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
