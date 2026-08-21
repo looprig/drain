@@ -16,12 +16,30 @@ import (
 // closed after the snapshot — leaves a window in which Acquire can grant a hold
 // that phase 4 never waits for and no Outcome ever reports.
 //
-// drained is nil exactly when outstanding is empty: there is nothing to wait for
+// settled is nil exactly when outstanding is empty: there is nothing to wait for
 // and nothing to close.
 type cutoff struct {
 	outstanding map[Reason]int
-	drained     <-chan struct{}
+	settled     <-chan struct{}
 }
+
+// ended names how a phase of the sequence finished. The three are mutually
+// exclusive per phase — one select branch wins — which is what makes the error
+// Wait returns a decision made once rather than a re-derivation from state that
+// has moved on by the time it is read.
+type ended uint8
+
+const (
+	// endedComplete: the phase ran to its own end. For the wait phase that
+	// means every fired OnDeadline returned and the total reached zero.
+	endedComplete ended = iota
+
+	// endedCeiling: the grace period expired first.
+	endedCeiling
+
+	// endedCancelled: Wait's ctx was done first.
+	endedCancelled
+)
 
 // Wait arms the idle timer and blocks until the sequence completes or ctx is
 // done. It installs no signal handling; use Run for that, or call Begin from
@@ -48,14 +66,37 @@ func (c *Coordinator) Wait(ctx context.Context) (Outcome, error) {
 		c.begin(CauseContext)
 	}
 	cause, beganAt := c.sequence()
+
+	// The ceiling is armed BEFORE the first user callback is started, and the
+	// order is the whole of "the ceiling covers phases 1-6": OnQuiesce runs
+	// inside it, not alongside it. Both it and the callback context are
+	// measured from Begin, so a Wait entered late gets what is left of the
+	// budget rather than a fresh one — the platform's countdown started at
+	// Begin whatever this process was doing at the time.
+	callbackCtx, cancelCallbacks := c.callbackContext(ctx, beganAt)
+	defer cancelCallbacks()
+	ceiling, stopCeiling := c.armCeiling(beganAt, cancelCallbacks)
+	defer stopCeiling()
+
+	// Phase 1, quiesce.
 	c.startQuiesce(cause)
 
 	// Phases 2 and 3, settle and the admission cutoff.
-	cut, cancelled := c.settle(ctx, beganAt)
+	cut, how := c.settle(ctx, beganAt)
 
 	// Phases 4 and 5, the wait and abandonment.
-	if !cancelled {
-		cancelled = c.awaitHolds(ctx, cut, beganAt)
+	if how == endedComplete {
+		how = c.awaitHolds(ctx, callbackCtx, ceiling, cut, beganAt)
+	}
+
+	// The ceiling is not a quiet exit. Phase 5 owes a report to every reason
+	// still outstanding that has not had one, and at the ceiling that set is
+	// never reliably empty: an unconfigured reason waits the full grace period,
+	// so its deadline and the ceiling are the same instant and which timer the
+	// clock reaches first is not a property worth depending on. abandon is
+	// once-per-reason, so a reason already told is not told twice.
+	if how == endedCeiling {
+		c.abandonRemaining(callbackCtx)
 	}
 
 	// Abandoned is what is still outstanding now, snapshotted ONCE: every hold
@@ -63,17 +104,94 @@ func (c *Coordinator) Wait(ctx context.Context) (Outcome, error) {
 	// the work the process is walking away from. Reasons configured with a zero
 	// deadline appear on every drain by design, which is why an alert on
 	// Abandoned > 0 has to exclude the reasons Outcome.Waited reports at zero.
-	// Task 14 adds Waited, and Task 10 hands this same map to
-	// GracePeriodExceededError rather than reading the counters a second time.
+	// Task 14 adds Waited.
 	out := Outcome{
 		Cause:     cause,
 		Duration:  c.cfg.clock.Now().Sub(beganAt),
 		Abandoned: c.Holds(),
 	}
-	if cancelled {
+	switch how {
+	case endedCancelled:
 		return out, ctx.Err()
+	case endedCeiling:
+		// The SAME map, not a second read of the counters: one snapshot under
+		// two names can never disagree with itself, and both aliases go to the
+		// same caller in the same return, so a defensive copy would protect
+		// nobody. The coordinator keeps no reference to it.
+		//
+		// It is nil when nothing was outstanding, which is a real state rather
+		// than a degenerate one: the exit condition is callbacks-returned AND
+		// total-zero, so the grace period can expire with every hold released
+		// and a wedged OnDeadline still running.
+		return out, &GracePeriodExceededError{
+			Elapsed:   out.Duration,
+			Budget:    c.gracePeriod,
+			Abandoned: out.Abandoned,
+		}
 	}
 	return out, nil
+}
+
+// callbackContext derives the ctx handed to OnDeadline from Wait's, with its
+// deadline at grace expiry. Cancelling it is armCeiling's job.
+//
+// The expiry is driven by the injected Clock rather than by
+// context.WithDeadline, and that is not an implementation detail a consumer can
+// ignore. Clock is the coordinator's entire dependency on time; a context
+// deadline is measured against the wall clock, so a consumer testing its own
+// shutdown wiring against draintest would get a callback ctx that expired at an
+// instant unrelated to the drain it was simulating — either seconds of real time
+// after the test had finished, or, for a clock started at a fixed date in the
+// past, before the callback ever ran.
+//
+// So the cancellation follows the clock and Deadline reports the instant that
+// cancellation is scheduled for, in that clock's own time base. Wait's ctx wins
+// when it expires first: a derived context may never outlive its parent's
+// deadline, and reporting one that does would make every context.WithTimeout
+// built on top of this one wrong.
+func (c *Coordinator) callbackContext(ctx context.Context, beganAt time.Time) (context.Context, context.CancelFunc) {
+	base, cancel := context.WithCancel(ctx)
+	expiry := beganAt.Add(c.gracePeriod)
+	if parent, ok := ctx.Deadline(); ok && !parent.After(expiry) {
+		return base, cancel
+	}
+	return ceilingContext{Context: base, deadline: expiry}, cancel
+}
+
+// ceilingContext is a cancellable context that reports the grace ceiling as its
+// deadline. Only Deadline is overridden; cancellation, Err, Value and everything
+// derived from them are the embedded context's.
+type ceilingContext struct {
+	context.Context
+	deadline time.Time
+}
+
+// Deadline reports grace expiry, measured on the coordinator's clock.
+func (c ceilingContext) Deadline() (time.Time, bool) { return c.deadline, true }
+
+// armCeiling starts the hard ceiling over the whole sequence and returns a
+// channel closed when it expires, together with a stop for the ordinary path
+// where the drain finishes first. expire is called at the same instant, and is
+// what makes the callback context expire at the ceiling.
+//
+// A non-positive remainder is closed immediately rather than armed, which is the
+// same rule the settle window and the per-reason deadlines follow and it is not
+// hypothetical here: a signal that arrives while the process is still starting
+// up can spend the entire budget before Wait is ever entered.
+func (c *Coordinator) armCeiling(beganAt time.Time, expire func()) (<-chan struct{}, func()) {
+	expired := make(chan struct{})
+	remaining := c.gracePeriod - c.cfg.clock.Now().Sub(beganAt)
+	if remaining <= 0 {
+		close(expired)
+		expire()
+		return expired, func() {}
+	}
+
+	timer := c.cfg.clock.AfterFunc(remaining, func() {
+		close(expired)
+		expire()
+	})
+	return expired, func() { timer.Stop() }
 }
 
 // claim reports whether this call is the one that gets to run the sequence. It
@@ -102,11 +220,24 @@ func (c *Coordinator) sequence() (Cause, time.Time) {
 }
 
 // startQuiesce runs OnQuiesce on a goroutine the coordinator owns. It is never
-// run on Wait's goroutine and never on Begin's: the abandon phase is user code
-// and the grace ceiling exists to bound it, so a callback that runs on the
+// run on Wait's goroutine and never on Begin's: a callback that runs on the
 // mechanism's own goroutine is a callback that can hang the mechanism meant to
-// bound it. Task 10 tracks this goroutine against the ceiling; until then a
-// callback that never returns is simply left to the exiting process.
+// bound it, and Begin is called from signal handlers, which are not a place to
+// spend a grace period.
+//
+// It is started after the ceiling is armed, so a wedged OnQuiesce is covered by
+// it — which is why OnQuiesce needs no separate "must not block" contract. It is
+// deliberately NOT counted towards the wait phase's exit condition. Covered by
+// the ceiling and waited for are different things, and only the first applies:
+// admission is closed by the time it could matter, so a process with nothing
+// outstanding must not be held for the full grace period waiting on a callback
+// whose only effect was to stop traffic that is already being refused.
+//
+// A wedged OnQuiesce therefore leaks this goroutine. That is deliberate and
+// bounded: the ceiling still fires, Wait still returns, and the process is
+// exiting. There is no cancellation path because there is nothing useful to
+// cancel — OnQuiesce takes no ctx, and a process that has decided to die does
+// not need its readiness callback to unwind tidily.
 func (c *Coordinator) startQuiesce(cause Cause) {
 	if c.cfg.onQuiesce == nil {
 		return
@@ -121,9 +252,16 @@ func (c *Coordinator) startQuiesce(cause Cause) {
 // gets what is left of it rather than a fresh one. Cancellation skips whatever
 // remains: there is no point protecting in-flight routing for a process that has
 // been told to stop.
-func (c *Coordinator) settle(ctx context.Context, beganAt time.Time) (cutoff, bool) {
+// The grace ceiling is deliberately absent from this select, and it is absent
+// because it is unreachable rather than because it is unimportant. New rejects a
+// settle window that is not strictly less than the grace period, and both are
+// measured from the same instant, so whenever the settle remainder is positive
+// the ceiling remainder is strictly larger. A settle window that outlives the
+// ceiling is a state New will not construct; a branch for it would be code no
+// test could reach.
+func (c *Coordinator) settle(ctx context.Context, beganAt time.Time) (cutoff, ended) {
 	if ctx.Err() != nil {
-		return c.cutAdmission(), true
+		return c.cutAdmission(), endedCancelled
 	}
 
 	// A non-positive remainder is dispatched directly rather than armed. The
@@ -132,22 +270,22 @@ func (c *Coordinator) settle(ctx context.Context, beganAt time.Time) (cutoff, bo
 	// deterministic test of an already-elapsed window instead of failing it.
 	remaining := c.cfg.preDrainDelay - c.cfg.clock.Now().Sub(beganAt)
 	if remaining <= 0 {
-		return c.cutAdmission(), false
+		return c.cutAdmission(), endedComplete
 	}
 
 	// The cut runs inside the timer's callback, so admission closes when the
 	// window expires rather than whenever Wait's goroutine is next scheduled.
 	// The buffer keeps that goroutine from blocking if cancellation got here
 	// first and nobody is left to receive.
-	settled := make(chan cutoff, 1)
-	timer := c.cfg.clock.AfterFunc(remaining, func() { settled <- c.cutAdmission() })
+	window := make(chan cutoff, 1)
+	timer := c.cfg.clock.AfterFunc(remaining, func() { window <- c.cutAdmission() })
 
 	select {
-	case cut := <-settled:
-		return cut, false
+	case cut := <-window:
+		return cut, endedComplete
 	case <-ctx.Done():
 		timer.Stop()
-		return c.cutAdmission(), true
+		return c.cutAdmission(), endedCancelled
 	}
 }
 
@@ -175,8 +313,8 @@ func (c *Coordinator) cutAdmission() cutoff {
 	c.admissionOpen = false
 	c.cutoff.outstanding = c.holdsLocked()
 	if c.total > 0 {
-		c.drained = make(chan struct{})
-		c.cutoff.drained = c.drained
+		c.settled = make(chan struct{})
+		c.cutoff.settled = c.settled
 	}
 	return c.cutoff
 }
@@ -190,23 +328,38 @@ func (c *Coordinator) cutAdmission() cutoff {
 // told (phase 5), after which drain keeps waiting for those holds until they
 // release or the ceiling expires — that is what makes interrupt-then-drain work,
 // and what keeps Abandoned from over-reporting work the owner successfully
-// abandoned. So the wait ends when the last hold releases, or when ctx is done;
-// the ceiling that bounds it otherwise is Task 10.
+// abandoned.
 //
-// It reports whether ctx cancelled the wait.
-func (c *Coordinator) awaitHolds(ctx context.Context, cut cutoff, beganAt time.Time) bool {
+// The wait therefore ends when the last hold has released AND every OnDeadline
+// that fired has returned, or at the grace ceiling, or when ctx is done —
+// whichever comes first, which is what this function reports.
+func (c *Coordinator) awaitHolds(ctx, callbackCtx context.Context, ceiling <-chan struct{}, cut cutoff, beganAt time.Time) ended {
 	if len(cut.outstanding) == 0 {
-		return false
+		return endedComplete
 	}
 
-	stop := c.armDeadlines(ctx, cut, beganAt)
+	stop := c.armDeadlines(callbackCtx, cut, beganAt)
 	defer stop()
 
+	// Completion is preferred over the ceiling when both are ready, which is a
+	// statement about determinism rather than about generosity: a drain whose
+	// last hold released at the same instant the ceiling expired either
+	// succeeded or overran depending on how a select shuffled its cases, and a
+	// process reports Abandoned to a dashboard. Nothing is outstanding on this
+	// branch, so preferring it costs no wait at all.
 	select {
-	case <-cut.drained:
-		return false
+	case <-cut.settled:
+		return endedComplete
+	default:
+	}
+
+	select {
+	case <-cut.settled:
+		return endedComplete
+	case <-ceiling:
+		return endedCeiling
 	case <-ctx.Done():
-		return true
+		return endedCancelled
 	}
 }
 
@@ -286,16 +439,20 @@ func (c *Coordinator) deadlineFor(r Reason) time.Duration {
 // while the callback is dispatched is a race the contract accepts, because the
 // alternative is holding the lock across user code.
 //
-// ctx is Wait's, which the callback contract says expires at the grace ceiling.
-// Deriving that deadline is Task 10, together with the tracking that bounds the
-// goroutine started here; until then a callback that never returns is left to
-// the exiting process, exactly as OnQuiesce's is.
+// It fires at most once per reason. Three paths reach it — a deadline timer that
+// came due, a deadline already spent when the wait phase began, and the ceiling
+// sweep — and for an unconfigured reason the first and the third are the SAME
+// INSTANT, because the deadline nobody configured is the full grace period. Two
+// reports for one reason would tell an owner to interrupt work it has already
+// been told to interrupt, so claimAbandon settles it under the lock.
+//
+// ctx is the callback context: Wait's, with its deadline at grace expiry.
 func (c *Coordinator) abandon(ctx context.Context, r Reason) {
 	if c.cfg.onDeadline == nil {
 		return
 	}
-	outstanding := c.outstandingFor(r)
-	if outstanding == 0 {
+	outstanding, ok := c.claimAbandon(r)
+	if !ok {
 		return
 	}
 
@@ -304,15 +461,78 @@ func (c *Coordinator) abandon(ctx context.Context, r Reason) {
 	// interrupts work whose deferred release() then runs on this goroutine
 	// before the callback returns, so a callback invoked under the lock would
 	// deadlock against releaseHold on the very path it exists to serve.
-	go c.cfg.onDeadline(ctx, r, outstanding)
+	//
+	// The goroutine is tracked rather than merely started: the wait phase does
+	// not end until it has returned, so an owner that is still unwinding
+	// interrupted work is not exited out from under. The ceiling is what bounds
+	// that, and a callback that never returns leaks this goroutine, which is
+	// acceptable for the same reason OnQuiesce's is.
+	go func() {
+		defer c.callbackReturned()
+		c.cfg.onDeadline(ctx, r, outstanding)
+	}()
 }
 
-// outstandingFor reports how many holds of reason r are outstanding right now.
-// It is a fresh read under the lock rather than a lookup in the cut's snapshot,
-// which is the difference between "still in flight" and "was in flight when
-// admission closed".
-func (c *Coordinator) outstandingFor(r Reason) int {
+// abandonRemaining is phase 5 at the ceiling: every reason still outstanding
+// that has not already had its report gets one, and Wait does not wait for them.
+//
+// Reasons are visited in sorted order for the same reason armDeadlines visits
+// them sorted — a map's order would make which of two simultaneous reports is
+// dispatched first differ run to run.
+func (c *Coordinator) abandonRemaining(ctx context.Context) {
+	if c.cfg.onDeadline == nil {
+		return
+	}
+	for _, r := range c.outstandingReasons() {
+		c.abandon(ctx, r)
+	}
+}
+
+// outstandingReasons lists the reasons with holds outstanding right now, sorted.
+func (c *Coordinator) outstandingReasons() []Reason {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.holds[r]
+	return slices.Sorted(maps.Keys(c.holds))
+}
+
+// claimAbandon decides, under the lock, whether reason r gets a report now, and
+// returns the count to hand the callback if it does.
+//
+// Three decisions in ONE critical section, and each of them has to be there:
+//
+//   - The once-per-reason guard, so the deadline timer and the ceiling sweep
+//     racing on the same instant produce one report rather than two.
+//   - The count re-read, so a reason whose work finished before the deadline
+//     expired gets NO callback rather than a callback with a zero. It is read
+//     fresh rather than taken from the cut's snapshot, which is the difference
+//     between "still in flight" and "was in flight when admission closed".
+//   - The in-flight callback count, incremented HERE rather than in the
+//     goroutine, so the wait phase can never observe the settled state between
+//     a nonzero count being read and the callback that was dispatched on the
+//     strength of it starting to run.
+//
+// The count handed over stays advisory: a release landing while the callback is
+// dispatched is a race the contract accepts, because the alternative is holding
+// the lock across user code.
+func (c *Coordinator) claimAbandon(r Reason) (int, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	outstanding := c.holds[r]
+	if outstanding == 0 || c.notified[r] {
+		return 0, false
+	}
+	c.notified[r] = true
+	c.callbacks++
+	return outstanding, true
+}
+
+// callbackReturned records that one OnDeadline invocation has finished, which
+// may be the last thing the wait phase was waiting for.
+func (c *Coordinator) callbackReturned() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.callbacks--
+	c.settleIfQuietLocked()
 }

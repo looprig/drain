@@ -1,5 +1,12 @@
+# -timeout is explicit and short. The default is ten minutes, and this suite's
+# most valuable regression — a user callback invoked under c.mu — is caught ONLY
+# as a hang: a goroutine parked on sync.Mutex.Lock is not durably blocked, so
+# testing/synctest cannot see it and no assertion in the suite converts it to a
+# failure. Ten minutes of silence for a deadlock the test knows about is a bad
+# trade; two minutes is far more than the whole suite needs, since nothing in it
+# sleeps in real time.
 test:
-	GOWORK=off go test -race ./...
+	GOWORK=off go test -race -timeout 120s ./...
 
 fmt:
 	gofmt -w .

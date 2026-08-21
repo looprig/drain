@@ -61,6 +61,14 @@ func TestWaitsForOutstandingHolds(t *testing.T) {
 //
 // The full grace period is measured from Begin like every other deadline, so the
 // settle window has already spent part of it by the time the timer is armed.
+//
+// Which puts an unconfigured reason's deadline at exactly the grace ceiling, and
+// that coincidence is a property of the policy rather than of this test: a hold
+// under a reason nobody configured that is still outstanding when its deadline
+// arrives is, by the same instant, a drain that has overrun. So the wait ends
+// here at the ceiling with the hold abandoned, and there is no room between the
+// two for the keep-waiting-after-abandon behaviour that a configured deadline
+// gets. It is one more reason to configure the reasons that matter.
 func TestUnconfiguredReasonGetsFullGracePeriod(t *testing.T) {
 	t.Parallel()
 
@@ -71,22 +79,26 @@ func TestUnconfiguredReasonGetsFullGracePeriod(t *testing.T) {
 		r.Begin(drain.CauseSignal)
 
 		hold := r.mustAcquire(reasonTurn)
+		defer hold()
 		r.closeSettleWindow()
 
 		r.advance(phaseWait, testGrace-testSettle-time.Nanosecond)
 		r.armed(1, "an unconfigured reason waits the full grace period, not a shorter default")
+		r.stillDraining("a nanosecond of the grace period is left")
 
 		// The arm was ordered by the advance above and the wait phase arms
 		// nothing further, so this last step needs no ordering of its own — and
 		// could not be given one, since reaching the phase again would block on
 		// a timer that has by then fired.
 		r.clock.Advance(time.Nanosecond)
-		r.armed(0, "the deadline of an unconfigured reason is the grace period, measured from Begin")
 
-		hold()
-		out := r.completed(drain.CauseSignal)
+		out, overrun := r.exceeded(drain.CauseSignal)
 		if out.Duration != testGrace {
-			t.Errorf("Outcome.Duration = %v, want %v", out.Duration, testGrace)
+			t.Errorf("Outcome.Duration = %v, want %v: the deadline of an unconfigured reason is "+
+				"the grace period, measured from Begin", out.Duration, testGrace)
+		}
+		if got := overrun.Abandoned[reasonTurn]; got != 1 {
+			t.Errorf("Abandoned = %v, want %d hold of %q", overrun.Abandoned, 1, reasonTurn)
 		}
 	})
 }
@@ -214,7 +226,7 @@ func TestWaitReturnsEarlyWhenAllHoldsRelease(t *testing.T) {
 		if out.Duration != testSettle+worked {
 			t.Errorf("Outcome.Duration = %v, want %v: the wait ends at the last release", out.Duration, testSettle+worked)
 		}
-		r.armed(0, "a deadline that never came due must be stopped when the wait ends")
+		r.allStopped("a deadline that never came due must be stopped when the wait ends")
 		if out.Abandoned != nil {
 			t.Errorf("Outcome.Abandoned = %v, want nil: nothing outlived its deadline", out.Abandoned)
 		}

@@ -22,9 +22,9 @@ import (
 	"github.com/looprig/drain/draintest"
 )
 
-// The policy every rig in this file is built with. The grace period is a
-// ceiling nothing in Task 7 can reach — the ceiling itself is Task 10 — and the
-// settle window is the only one that matters here.
+// The default policy every rig is built with. Individual tests override one or
+// both through newRigWithPolicy — the ceiling tests need a grace period the
+// sequence can actually reach, and the idle tests need an idle timeout.
 const (
 	testGrace  = 30 * time.Second
 	testSettle = 5 * time.Second
@@ -52,15 +52,23 @@ var epoch = time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
 type phase int
 
 const (
-	// phaseSettle is Wait inside the settle window: the settle timer is armed
-	// and, until Task 10, nothing else is.
-	phaseSettle phase = iota
+	// phaseIdle is Wait BEFORE the sequence has started: no drain is running,
+	// so the only timer that can be armed is the idle timer, and it is armed
+	// only while the total is zero. A rig with no idle timeout never reaches
+	// this phase, because nothing arms.
+	phaseIdle phase = iota
 
-	// phaseWait is Wait inside the wait phase: the settle timer has fired, and
-	// one deadline timer is armed for every reason the cut named whose deadline
-	// had not already passed. A reason whose deadline is spent when the wait
-	// phase begins — a zero-deadline pending gate, or any deadline shorter than
-	// the settle window — arms nothing, so it is not counted.
+	// phaseSettle is Wait inside the settle window: the grace ceiling and the
+	// settle timer. The idle timer is stopped by Begin, and a stopped timer is
+	// not an armed one, so it does not count here.
+	phaseSettle
+
+	// phaseWait is Wait inside the wait phase: the grace ceiling, and one
+	// deadline timer for every reason the cut named whose deadline had not
+	// already passed. The settle timer has fired by then. A reason whose
+	// deadline is spent when the wait phase begins — a zero-deadline pending
+	// gate, or any deadline shorter than the settle window — arms nothing, so
+	// it is not counted.
 	phaseWait
 )
 
@@ -110,31 +118,63 @@ func bubbled(t *testing.T, fn func(t *testing.T, ctx context.Context)) {
 type rig struct {
 	t      *testing.T
 	clock  *draintest.Clock
-	settle time.Duration
+	policy rigPolicy
 	done   chan waitResult
 
 	// waitTimers is how many per-reason deadline timers this test's holds
-	// produce, declared through armsInWait. It is rig state rather than a
-	// parameter of armedIn because it is a property of the holds a test takes
-	// and not of any phase but one: threading a reason count through reach and
-	// advance would make every settle-phase ordering point in the suite carry a
-	// number that means nothing there.
+	// produce, declared through armsInWait, and idleTimers is whether the idle
+	// timer is armed at the ordering point a test is about to take, declared
+	// through armsIdle. Both are rig state rather than parameters of armedIn
+	// because each is a property of the holds a test takes and means nothing in
+	// the other's phase: threading two counts through reach and advance would
+	// make every ordering point in the suite carry a number that is noise there.
+	//
+	// idleTimers defaults to one for a rig with an idle timeout, which is the
+	// state at Wait entry with nothing outstanding. A test that enters Wait
+	// holding something — the startup-hold pattern — says armsIdle(0), because
+	// the idle timer arms on a nonzero→zero transition and there has not been
+	// one.
 	waitTimers int
+	idleTimers int
 
 	*drain.Coordinator
 }
 
-// newRig builds a coordinator on a deterministic clock with the standard settle
-// window.
+// rigPolicy is the part of a coordinator's policy the rig must know to own the
+// timer count. It is a struct rather than a growing parameter list so that a
+// test names the value it is changing.
+//
+// It is not optional state: the rig can only own the count if it knows the
+// policy that produces the timers, so a WithPreDrainDelay, WithIdleTimeout or
+// WithClock passed through opts instead would silently desynchronize armedIn
+// from the coordinator.
+type rigPolicy struct {
+	grace  time.Duration
+	settle time.Duration
+	idle   time.Duration
+
+	// start is where the fake clock begins, defaulting to epoch. Only a test
+	// that compares the coordinator's time base against the real one needs to
+	// set it — the callback context's deadline is the one value drain reports
+	// in clock time that a caller may hold up against a wall-clock deadline of
+	// its own.
+	start time.Time
+}
+
+// newRig builds a coordinator on a deterministic clock with the standard policy.
 func newRig(t *testing.T, opts ...drain.Option) *rig {
 	t.Helper()
 	return newRigWithSettle(t, testSettle, opts...)
 }
 
-// newRigWithSettle is newRig with a chosen settle window. The window is a rig
-// parameter rather than one of opts on purpose: the rig can only own the timer
-// count if it knows the policy that produces the timers, so a WithPreDrainDelay
-// passed through opts would silently desynchronize armedIn from the coordinator.
+// newRigWithSettle is newRig with a chosen settle window.
+func newRigWithSettle(t *testing.T, settle time.Duration, opts ...drain.Option) *rig {
+	t.Helper()
+	return newRigWithPolicy(t, rigPolicy{grace: testGrace, settle: settle}, opts...)
+}
+
+// newRigWithPolicy builds a coordinator on a deterministic clock with a policy
+// the rig knows in full.
 //
 // The rig's own options are appended LAST, so that last-option-wins gives the
 // rig the win rather than the caller. That is enforcement, not preference: an
@@ -143,19 +183,31 @@ func newRig(t *testing.T, opts ...drain.Option) *rig {
 // never reads, so every reach in the suite would block on an arm that can never
 // happen. Documenting the rule and then letting opts override it puts a hang one
 // typo away.
-func newRigWithSettle(t *testing.T, settle time.Duration, opts ...drain.Option) *rig {
+func newRigWithPolicy(t *testing.T, policy rigPolicy, opts ...drain.Option) *rig {
 	t.Helper()
 
-	clock := draintest.NewClock(epoch)
-	all := make([]drain.Option, 0, len(opts)+2)
-	all = append(all, opts...)
-	all = append(all, drain.WithClock(clock), drain.WithPreDrainDelay(settle))
-
-	c, err := drain.New(testGrace, all...)
-	if err != nil {
-		t.Fatalf("New(%v) = _, %v, want a valid coordinator", testGrace, err)
+	if policy.start.IsZero() {
+		policy.start = epoch
 	}
-	return &rig{t: t, clock: clock, settle: settle, done: make(chan waitResult, 1), Coordinator: c}
+	clock := draintest.NewClock(policy.start)
+	all := make([]drain.Option, 0, len(opts)+3)
+	all = append(all, opts...)
+	all = append(all,
+		drain.WithClock(clock),
+		drain.WithPreDrainDelay(policy.settle),
+		drain.WithIdleTimeout(policy.idle),
+	)
+
+	c, err := drain.New(policy.grace, all...)
+	if err != nil {
+		t.Fatalf("New(%v) = _, %v, want a valid coordinator", policy.grace, err)
+	}
+
+	r := &rig{t: t, clock: clock, policy: policy, done: make(chan waitResult, 1), Coordinator: c}
+	if policy.idle > 0 {
+		r.idleTimers = 1
+	}
+	return r
 }
 
 // armedIn reports how many timers the coordinator has armed once it has reached
@@ -166,25 +218,36 @@ func newRigWithSettle(t *testing.T, settle time.Duration, opts ...drain.Option) 
 // A test that hard-coded 1 would return the moment the coordinator armed any
 // timer and then advance while a second one was still unarmed — leaving that
 // second timer waiting on a deadline the clock has already passed, so the test
-// hangs to the binary's -timeout instead of failing. Later tasks add their
-// timers here and nowhere else: the grace ceiling (Task 10), the per-reason
-// deadline timers (Task 8), the idle timer (Task 11).
+// hangs to the binary's -timeout instead of failing. Every timer the coordinator
+// arms is accounted for here and nowhere else: the grace ceiling, the settle
+// window, the per-reason deadlines, and the idle timer.
 func (r *rig) armedIn(p phase) int {
-	n := 0
-	// The settle timer. A non-positive window arms nothing at all — the
-	// sequence dispatches straight to the cut rather than arming a timer the
-	// fake clock would never fire — so the count is zero there. Neither does a
-	// window whose remainder is already spent at Wait entry, which is why
-	// TestSettleWindowAlreadyElapsedAtWaitEntry never reaches a phase.
-	if p == phaseSettle && r.settle > 0 {
-		n++
+	switch p {
+	case phaseIdle:
+		// Nothing else can be armed before the sequence starts: the ceiling,
+		// the settle window and every deadline belong to a drain that has not
+		// begun.
+		return r.idleTimers
+	case phaseSettle:
+		// The grace ceiling, armed at quiesce and stopped when Wait returns,
+		// plus the settle timer. A non-positive settle window arms nothing at
+		// all — the sequence dispatches straight to the cut rather than arming
+		// a timer the fake clock would never fire — and neither does a window
+		// whose remainder is already spent at Wait entry, which is why
+		// TestSettleWindowAlreadyElapsedAtWaitEntry never reaches a phase.
+		n := 1
+		if r.policy.settle > 0 {
+			n++
+		}
+		return n
+	case phaseWait:
+		// The ceiling again, plus one deadline timer per reason still owed a
+		// deadline at the cut. The settle timer has fired by then.
+		return 1 + r.waitTimers
+	default:
+		r.t.Fatalf("armedIn(%d): unknown phase", p)
+		return 0
 	}
-	// The per-reason deadline timers, one per reason still owed a deadline at
-	// the cut. The settle timer has fired by then and is no longer armed.
-	if p == phaseWait {
-		n += r.waitTimers
-	}
-	return n
 }
 
 // armsInWait declares how many per-reason deadline timers the coordinator arms
@@ -214,7 +277,23 @@ func (r *rig) start(ctx context.Context) {
 // the reason no test in this suite writes BlockUntil itself.
 func (r *rig) reach(p phase) {
 	r.t.Helper()
-	r.clock.BlockUntil(r.armedIn(p))
+
+	want := r.armedIn(p)
+	r.clock.BlockUntil(want)
+
+	// BlockUntil unblocks at "at least n", so two phases whose counts coincide
+	// alias: a reach(phaseWait) expecting the ceiling plus one deadline would
+	// otherwise be satisfied by the ceiling plus the settle timer and return
+	// while the coordinator was still in settle. It cannot happen as the suite
+	// is written — every phaseWait ordering point follows the advance that fired
+	// the settle timer — but "cannot happen" is exactly the assumption that
+	// reintroduces the race the rig exists to prevent, and its failure is
+	// silent. So the count is checked for equality once the block releases,
+	// which turns the aliasing into an assertion instead.
+	if got := r.clock.Armed(); got != want {
+		r.t.Fatalf("Armed() = %d on reaching phase %d, want exactly %d: "+
+			"the ordering point does not match the coordinator's timers", got, p, want)
+	}
 }
 
 // advance reaches p and then moves the clock. Only one goroutine ever advances,
@@ -234,7 +313,7 @@ func (r *rig) advance(p phase, d time.Duration) {
 // a test can assert the refusal immediately instead of racing Wait's goroutine.
 func (r *rig) closeSettleWindow() {
 	r.t.Helper()
-	r.advance(phaseSettle, r.settle)
+	r.advance(phaseSettle, r.policy.settle)
 }
 
 // grants reports whether Acquire still admits work, without leaving a hold
@@ -279,15 +358,36 @@ func (r *rig) stillDraining(why string) {
 	}
 }
 
-// armed asserts the number of timers the coordinator currently has armed. Every
-// caller has already ordered itself against the arming through reach; this
-// reports what happened to those timers afterwards, which is how a deadline's
-// arithmetic is observed before phase 5 has anything to say.
-func (r *rig) armed(want int, why string) {
+// armed asserts how many PER-REASON DEADLINE timers the coordinator currently
+// has armed, during a running sequence. Every caller has already ordered itself
+// against the arming through reach; this reports what happened to those timers
+// afterwards, which is how a deadline's arithmetic is observed.
+//
+// The grace ceiling is added here rather than at each call site, which is the
+// whole reason the count is expressed this way: a timer the coordinator holds
+// for the length of the sequence is not a fact about any one test's deadlines,
+// and folding it into twelve literals would mean twelve edits the next time the
+// sequence gains one. Use allStopped for the assertion after Wait has returned,
+// where the ceiling is stopped along with everything else.
+func (r *rig) armed(wantDeadlines int, why string) {
 	r.t.Helper()
 
+	want := wantDeadlines + 1 // the grace ceiling, armed for the whole sequence
 	if got := r.clock.Armed(); got != want {
-		r.t.Fatalf("Armed() = %d, want %d: %s", got, want, why)
+		r.t.Fatalf("Armed() = %d, want %d (%d deadline timer(s) plus the grace ceiling): %s",
+			got, want, wantDeadlines, why)
+	}
+}
+
+// allStopped asserts that the coordinator left no timer armed. It is the
+// after-the-fact half of armed: a drain that has returned must have stopped its
+// ceiling and every deadline that never came due, rather than leaving them to
+// fire against a spent coordinator.
+func (r *rig) allStopped(why string) {
+	r.t.Helper()
+
+	if got := r.clock.Armed(); got != 0 {
+		r.t.Fatalf("Armed() = %d after the drain, want 0: %s", got, why)
 	}
 }
 
@@ -298,6 +398,31 @@ func (r *rig) armed(want int, why string) {
 func (r *rig) result() waitResult {
 	r.t.Helper()
 	return <-r.done
+}
+
+// exceeded is result with the assertion an overrun makes: a valid Outcome AND a
+// *GracePeriodExceededError, because the caller still has to exit cleanly and
+// still wants the telemetry. It returns both, since the error's fields are the
+// point of most of the tests that use it.
+func (r *rig) exceeded(wantCause drain.Cause) (drain.Outcome, *drain.GracePeriodExceededError) {
+	r.t.Helper()
+
+	res := r.result()
+	var overrun *drain.GracePeriodExceededError
+	if !errors.As(res.err, &overrun) {
+		r.t.Fatalf("Wait() = _, %v, want a *drain.GracePeriodExceededError", res.err)
+	}
+	if res.out.Cause != wantCause {
+		r.t.Errorf("Outcome.Cause = %v, want %v", res.out.Cause, wantCause)
+	}
+	if res.out.Duration != overrun.Elapsed {
+		r.t.Errorf("Outcome.Duration = %v but the error reports Elapsed = %v; they are one number",
+			res.out.Duration, overrun.Elapsed)
+	}
+	if overrun.Budget != r.policy.grace {
+		r.t.Errorf("GracePeriodExceededError.Budget = %v, want %v", overrun.Budget, r.policy.grace)
+	}
+	return res.out, overrun
 }
 
 // completed is result with the assertion every clean drain makes.
@@ -477,10 +602,23 @@ func TestOnQuiesceRunsOnceWithCause(t *testing.T) {
 		}
 	})
 
-	// The callback here never returns. An implementation that ran OnQuiesce on
-	// Wait's own goroutine — or that waited for it before returning — fails this
-	// as a hang, which is what Task 10's ceiling would otherwise have no way to
-	// bound.
+	// The callback here never returns, and the drain has nothing outstanding, so
+	// Wait must return at the settle boundary with err == nil.
+	//
+	// Both halves of that are the contract rather than an accident of this
+	// task's implementation. An OnQuiesce run on Wait's own goroutine hangs
+	// here. So does one the wait phase treats as an exit gate — and that is the
+	// assertion worth being explicit about, because "wait for OnQuiesce" is the
+	// plausible reading of "the ceiling covers phase 1". It is not: being
+	// covered by the ceiling and being waited for are different things, and only
+	// the first applies. OnQuiesce's job is to fail a readiness probe, which the
+	// closed admission flag has already made redundant, so a process with
+	// nothing outstanding must not be held for the grace period on its account.
+	//
+	// What this test does NOT show is that the ceiling covers phase 1 at all: it
+	// passes just as well against a coordinator that never waits on OnQuiesce
+	// AND has no ceiling. TestHungOnQuiesceDoesNotBlockCeiling is the one that
+	// needs a hold that never releases, and it is the one that proves it.
 	t.Run("on a coordinator-owned goroutine", func(t *testing.T) {
 		t.Parallel()
 
@@ -710,9 +848,7 @@ func TestZeroSettleWindowCutsWithoutArmingATimer(t *testing.T) {
 	if out.Duration != 0 {
 		t.Errorf("Outcome.Duration = %v, want 0", out.Duration)
 	}
-	if got := r.clock.Armed(); got != 0 {
-		t.Errorf("Armed() = %d, want 0: a zero settle window must not arm a timer", got)
-	}
+	r.allStopped("a zero settle window must not arm a timer, and the ceiling is stopped on the way out")
 	if r.grants(reasonTurn) {
 		t.Error("Acquire granted after a zero-length settle window, want refused")
 	}
@@ -747,7 +883,7 @@ func TestSettleWindowAlreadyElapsedAtWaitEntry(t *testing.T) {
 		// No further advance: the window is spent, so the sequence must cut and
 		// return on its own.
 		out := r.completed(drain.CauseSignal)
-		r.armed(0, "a settle window already spent at Wait entry must not arm a timer")
+		r.allStopped("a settle window already spent at Wait entry must not arm a timer")
 		if out.Duration != elapsed {
 			t.Errorf("Outcome.Duration = %v, want %v", out.Duration, elapsed)
 		}
@@ -761,48 +897,29 @@ func TestSettleWindowAlreadyElapsedAtWaitEntry(t *testing.T) {
 // 4: a hold that was admitted before the cutoff is owed, and the sequence does
 // not end while it is outstanding.
 //
-// It is the one test in this suite that runs inside a testing/synctest bubble,
-// and it needs to be. The claim is that Wait has NOT returned, and proving an
-// absence needs a happens-before edge rather than a hopeful non-blocking
-// receive: an implementation that skipped the wait phase entirely passed ten
-// consecutive runs of the naive version, because Wait's goroutine had not been
-// scheduled yet at the instant the test looked. synctest.Wait supplies the edge
-// — it returns only once every other goroutine in the bubble is durably blocked,
-// so a Wait that was going to return has already returned by then.
-//
-// draintest's own doc comment names synctest as the alternative available to
-// tests inside drain. It is not this suite's default mechanism for the reason
-// given there: draintest is exported for drain's consumers, and requiring them
-// to run their shutdown wiring inside a bubble is a constraint the module has no
-// standing to impose.
+// It runs inside a bubble because the claim is that Wait has NOT returned, and
+// proving an absence needs a happens-before edge rather than a hopeful
+// non-blocking receive: an implementation that skipped the wait phase entirely
+// passed ten consecutive runs of the naive version, because Wait's goroutine had
+// not been scheduled yet at the instant the test looked. synctest.Wait supplies
+// the edge — it returns only once every other goroutine in the bubble is durably
+// blocked, so a Wait that was going to return has already returned by then. That
+// is what rig.stillDraining wraps, and by now most of the suite is bubbled for
+// the same reason.
 func TestWaitBlocksUntilOutstandingHoldsRelease(t *testing.T) {
 	t.Parallel()
 
-	synctest.Test(t, func(t *testing.T) {
-		// Derived inside the bubble on purpose: a context created outside it
-		// has a Done channel the bubble does not own, and a goroutine selecting
-		// on one is not durably blocked, so synctest.Wait would never return.
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
+	bubbled(t, func(t *testing.T, ctx context.Context) {
 		r := newRig(t)
+		r.armsInWait(1)
 		r.start(ctx)
 		r.Begin(drain.CauseSignal)
 
 		r.reach(phaseSettle)
-		release, ok := r.Acquire(reasonTurn)
-		if !ok {
-			t.Fatal("Acquire refused inside the settle window of a signal drain, want granted")
-		}
+		release := r.mustAcquire(reasonTurn)
 		r.closeSettleWindow()
 
-		// Every other goroutine — Wait's included — is now durably blocked.
-		synctest.Wait()
-		select {
-		case res := <-r.done:
-			t.Fatalf("Wait() returned %+v while a hold admitted during settle was still outstanding", res)
-		default:
-		}
+		r.stillDraining("a hold admitted during the settle window is owed")
 		if got := r.Holds()[reasonTurn]; got != 1 {
 			t.Errorf("Holds()[%q] = %d during the wait phase, want 1", reasonTurn, got)
 		}

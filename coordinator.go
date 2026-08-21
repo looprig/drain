@@ -92,12 +92,26 @@ type Coordinator struct {
 	cut    bool
 	cutoff cutoff
 
-	// drained is closed when the holds the cutoff named have all released. It
-	// is the send side of cutoff.drained, kept separately because that one is
-	// receive-only, and it is set to nil once closed so the close cannot
-	// happen twice. Admission is shut before it exists, so the total only ever
-	// falls afterwards and reaches zero exactly once.
-	drained chan struct{}
+	// callbacks counts the OnDeadline invocations currently in flight, and
+	// notified records the reasons that have already had one. Together they are
+	// half of the wait phase's exit condition and the whole of its
+	// once-per-reason guarantee.
+	//
+	// The count is incremented in the SAME critical section that reads the
+	// outstanding count the callback is about to be handed, which is what makes
+	// "every fired OnDeadline has returned and the total reached zero" a state
+	// the coordinator is never briefly and wrongly in: a callback dispatched on
+	// the strength of a nonzero count cannot be beaten to the settle by the
+	// release of that very hold.
+	callbacks int
+	notified  map[Reason]bool
+
+	// settled is closed once the holds the cutoff named have all released AND
+	// every OnDeadline that fired has returned. It is the send side of
+	// cutoff.settled, kept separately because that one is receive-only, and it
+	// is set to nil once closed so the close cannot happen twice. Admission is
+	// shut before it exists, so the total only ever falls afterwards.
+	settled chan struct{}
 }
 
 // New returns a Coordinator whose sequence is bounded by gracePeriod, measured
@@ -141,6 +155,7 @@ func New(gracePeriod time.Duration, opts ...Option) (*Coordinator, error) {
 		gracePeriod:   gracePeriod,
 		cfg:           cfg,
 		holds:         make(map[Reason]int),
+		notified:      make(map[Reason]bool),
 		admissionOpen: true,
 		begun:         make(chan struct{}),
 	}, nil
@@ -268,8 +283,8 @@ func (c *Coordinator) Acquire(r Reason) (release func(), ok bool) {
 // section the sequence races: an implementation that read the flag, dropped the
 // lock and then incremented would grant holds the cut has already snapshotted
 // past, which TestAdmissionCutoffAndSnapshotAreOneCriticalSection exists to
-// catch. Code that will grow — Task 11 adds the idle generation bump on the
-// zero→nonzero transition, here, inside this same section — should not grow
+// catch. Code that grew — the idle generation bump on the zero→nonzero
+// transition lives here, inside this same section — should not grow
 // around a hand-balanced unlock, where an inserted early return leaks the mutex.
 //
 // The name deviates from the -Locked suffix used elsewhere in this file
@@ -307,13 +322,34 @@ func (c *Coordinator) releaseHold(r Reason) {
 		delete(c.holds, r)
 	}
 
-	// The wait phase's exit condition. drained is nil until the cut installs it
-	// and again once it has fired, so a release before the drain, or after the
-	// sequence has already ended, simply decrements.
-	if c.total == 0 && c.drained != nil {
-		close(c.drained)
-		c.drained = nil
+	c.settleIfQuietLocked()
+}
+
+// settleIfQuietLocked closes the wait phase's exit channel once nothing is left
+// to wait for. The caller must hold c.mu.
+//
+// BOTH clauses are the exit condition, and the second is the one that is easy to
+// drop: the abandon phase is user code, so a drain that ended the moment the
+// last hold released would return while an OnDeadline callback was still running
+// — on a goroutine the process is about to exit out from under. The grace
+// ceiling is what bounds that wait; a callback that never returns is not waited
+// for beyond it.
+//
+// OnQuiesce is deliberately absent from both clauses. It is covered by the
+// ceiling, like every other callback, but it is not an exit gate: its job —
+// failing the readiness probe — has already been made redundant by the closed
+// admission flag, so holding a process with nothing outstanding for the full
+// grace period on its account would trade a guaranteed delay for nothing.
+//
+// settled is nil until the cut installs it and again once it has fired, so a
+// release before the drain, or after the sequence has already ended, simply
+// decrements.
+func (c *Coordinator) settleIfQuietLocked() {
+	if c.settled == nil || c.total != 0 || c.callbacks != 0 {
+		return
 	}
+	close(c.settled)
+	c.settled = nil
 }
 
 // Draining reports whether the sequence has begun. It is advisory — suitable for
