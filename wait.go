@@ -58,7 +58,18 @@ func (c *Coordinator) Wait(ctx context.Context) (Outcome, error) {
 		cancelled = c.awaitHolds(ctx, cut, beganAt)
 	}
 
-	out := Outcome{Cause: cause, Duration: c.cfg.clock.Now().Sub(beganAt)}
+	// Abandoned is what is still outstanding now, snapshotted ONCE: every hold
+	// that reached a boundary has released by here, so what remains is exactly
+	// the work the process is walking away from. Reasons configured with a zero
+	// deadline appear on every drain by design, which is why an alert on
+	// Abandoned > 0 has to exclude the reasons Outcome.Waited reports at zero.
+	// Task 14 adds Waited, and Task 10 hands this same map to
+	// GracePeriodExceededError rather than reading the counters a second time.
+	out := Outcome{
+		Cause:     cause,
+		Duration:  c.cfg.clock.Now().Sub(beganAt),
+		Abandoned: c.Holds(),
+	}
 	if cancelled {
 		return out, ctx.Err()
 	}
@@ -188,7 +199,7 @@ func (c *Coordinator) awaitHolds(ctx context.Context, cut cutoff, beganAt time.T
 		return false
 	}
 
-	stop := c.armDeadlines(cut, beganAt)
+	stop := c.armDeadlines(ctx, cut, beganAt)
 	defer stop()
 
 	select {
@@ -209,7 +220,7 @@ func (c *Coordinator) awaitHolds(ctx context.Context, cut cutoff, beganAt time.T
 // the immediate dispatches below are the visible half of this loop, and a map's
 // order would make which of two spent deadlines is reported first differ run to
 // run.
-func (c *Coordinator) armDeadlines(cut cutoff, beganAt time.Time) func() {
+func (c *Coordinator) armDeadlines(ctx context.Context, cut cutoff, beganAt time.Time) func() {
 	elapsed := c.cfg.clock.Now().Sub(beganAt)
 
 	timers := make([]Timer, 0, len(cut.outstanding))
@@ -229,10 +240,10 @@ func (c *Coordinator) armDeadlines(cut cutoff, beganAt time.Time) func() {
 		// fail in every deterministic test its consumers write.
 		remaining := c.deadlineFor(r) - elapsed
 		if remaining <= 0 {
-			c.abandon(r)
+			c.abandon(ctx, r)
 			continue
 		}
-		timers = append(timers, c.cfg.clock.AfterFunc(remaining, func() { c.abandon(r) }))
+		timers = append(timers, c.cfg.clock.AfterFunc(remaining, func() { c.abandon(ctx, r) }))
 	}
 
 	return func() {
@@ -254,13 +265,54 @@ func (c *Coordinator) deadlineFor(r Reason) time.Duration {
 	return c.gracePeriod
 }
 
-// abandon is phase 5 for one reason: the point at which its deadline has passed
-// with holds still outstanding. Task 9 fills it in — the re-check under the lock
-// that skips a reason whose count reached zero, and OnDeadline on a
-// coordinator-owned goroutine.
+// abandon is phase 5 for one reason: its deadline has passed, so the owner is
+// told. It is the single point both ways a deadline can pass converge on — a
+// timer that came due, and a deadline already spent when the wait phase began —
+// which is what keeps the zero-deadline pending gate on ordinary code rather
+// than a special case bolted onto the side of the phase.
 //
-// It is already the single point both ways a deadline can pass converge on: a
-// timer that came due, and a deadline that was spent before the wait phase began.
-// Keeping them one path is what makes the zero-deadline case ordinary code
-// rather than a special case bolted onto phase 5 later.
-func (c *Coordinator) abandon(r Reason) {}
+// It tells the owner and nothing more. drain does not interrupt, cancel, or
+// forget anything: it has no idea what the work is, and the wait continues until
+// those holds release or the ceiling expires. That is what makes
+// interrupt-then-drain work at all, since interrupted work needs time to unwind,
+// and it is what keeps Abandoned from over-reporting work the owner successfully
+// abandoned.
+//
+// The count is re-read under the lock at invocation rather than taken from the
+// cut's snapshot, and a reason whose count has since reached zero gets NO
+// callback — not a callback with a zero. The owner's abandon path is a real
+// action, and telling it to interrupt a turn that already finished is worse than
+// saying nothing. The value handed over remains advisory: a release landing
+// while the callback is dispatched is a race the contract accepts, because the
+// alternative is holding the lock across user code.
+//
+// ctx is Wait's, which the callback contract says expires at the grace ceiling.
+// Deriving that deadline is Task 10, together with the tracking that bounds the
+// goroutine started here; until then a callback that never returns is left to
+// the exiting process, exactly as OnQuiesce's is.
+func (c *Coordinator) abandon(ctx context.Context, r Reason) {
+	if c.cfg.onDeadline == nil {
+		return
+	}
+	outstanding := c.outstandingFor(r)
+	if outstanding == 0 {
+		return
+	}
+
+	// On a goroutine the coordinator owns, and — the load-bearing half — with
+	// c.mu released. The expected shape of abandonment is that the owner
+	// interrupts work whose deferred release() then runs on this goroutine
+	// before the callback returns, so a callback invoked under the lock would
+	// deadlock against releaseHold on the very path it exists to serve.
+	go c.cfg.onDeadline(ctx, r, outstanding)
+}
+
+// outstandingFor reports how many holds of reason r are outstanding right now.
+// It is a fresh read under the lock rather than a lookup in the cut's snapshot,
+// which is the difference between "still in flight" and "was in flight when
+// admission closed".
+func (c *Coordinator) outstandingFor(r Reason) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.holds[r]
+}
