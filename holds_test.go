@@ -1,13 +1,17 @@
 package drain
 
-// Internal, like options_test.go and for the same reason. Almost everything
-// Task 5 delivers is exported and is asserted here through the exported surface
-// a caller uses — but the admission flag has no exported way to be closed until
-// Begin lands in Task 6, and the property that most needs pinning now is exactly
-// the one on the closed side: that a refused Acquire still hands back a callable
-// no-op release. `release, _ := c.Acquire(r); defer release()` is the shape every
-// consumer writes, and deferring the assertion to a later task would mean
-// shipping a task whose stated contract nothing checked.
+// Internal, like options_test.go, though nearly everything here is asserted
+// through the exported surface a caller uses. The one internal reach left is
+// outstandingTotal: the running total the mutex guards alongside the per-reason
+// counters has no exported reader by design — Holds is per reason — and the
+// invariant that it agrees with the sum of the counters is worth asserting
+// directly, because the wait phase is driven by the total and not by the map.
+//
+// This file used to close admission by writing the flag itself, which modelled
+// the cutover differently from the way production performs it: production closes
+// admission and snapshots the outstanding holds in one critical section, and a
+// helper that only wrote the flag could not have exercised that. Admission is
+// now closed the way a process closes it — by beginning a drain.
 
 import (
 	"sync"
@@ -28,14 +32,6 @@ func newCoordinator(t *testing.T, opts ...Option) *Coordinator {
 		t.Fatalf("New(%v) = _, %v, want no error", testGrace, err)
 	}
 	return c
-}
-
-// closeAdmission shuts admission the way the sequence will once Wait exists.
-// This is the one internal reach in this file: see the file comment.
-func closeAdmission(c *Coordinator) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.admissionOpen = false
 }
 
 // outstandingTotal reads the running total the mutex guards alongside the
@@ -171,7 +167,9 @@ func TestReleaseNeverNil(t *testing.T) {
 			defer keep()
 
 			if tc.admissionClosed {
-				closeAdmission(c)
+				// Begin(CauseIdle), because an idle drain closes admission at
+				// Begin: that is the cutover a consumer actually meets.
+				c.Begin(CauseIdle)
 			}
 
 			release, ok := c.Acquire(refused)

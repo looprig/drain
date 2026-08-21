@@ -65,12 +65,39 @@ type Coordinator struct {
 	// boundary.
 	admissionOpen bool
 
-	// draining reports whether the sequence has begun, and cause is the first
-	// cause recorded. Both are written once, by the Begin that transitions
-	// draining from false to true, which is what makes Outcome.Cause
-	// deterministic under a race between a signal and the idle timer.
+	// draining reports whether the sequence has begun, cause is the first cause
+	// recorded, and beganAt is when. All three are written once, by the Begin
+	// that transitions draining from false to true, which is what makes
+	// Outcome.Cause deterministic under a race between a signal and the idle
+	// timer. beganAt is the epoch every budget in the sequence is measured
+	// from: the settle window, the per-reason deadlines, and the grace ceiling.
 	draining bool
 	cause    Cause
+	beganAt  time.Time
+
+	// begun is closed by that same Begin. Wait blocks on it, so the sequence
+	// runs on Wait's goroutine no matter which goroutine started it — a signal
+	// handler is not a place to run a drain.
+	begun chan struct{}
+
+	// waiting records that Wait has been claimed. A coordinator runs its
+	// sequence once and is permanently spent afterwards; a second Wait,
+	// concurrent or after the first returned, gets ErrAlreadyRunning.
+	waiting bool
+
+	// cut records that phase 3 has run, and cutoff is what it saw. The cut is
+	// idempotent because two things can reach it — the settle timer's callback
+	// and a cancelled context — and the wait phase must be owed exactly one
+	// snapshot however it got there.
+	cut    bool
+	cutoff cutoff
+
+	// drained is closed when the holds the cutoff named have all released. It
+	// is the send side of cutoff.drained, kept separately because that one is
+	// receive-only, and it is set to nil once closed so the close cannot
+	// happen twice. Admission is shut before it exists, so the total only ever
+	// falls afterwards and reaches zero exactly once.
+	drained chan struct{}
 }
 
 // New returns a Coordinator whose sequence is bounded by gracePeriod, measured
@@ -115,6 +142,7 @@ func New(gracePeriod time.Duration, opts ...Option) (*Coordinator, error) {
 		cfg:           cfg,
 		holds:         make(map[Reason]int),
 		admissionOpen: true,
+		begun:         make(chan struct{}),
 	}, nil
 }
 
@@ -218,21 +246,45 @@ func noopRelease() {}
 //
 // Acquire's ok is the only admission authority. Draining is advisory.
 func (c *Coordinator) Acquire(r Reason) (release func(), ok bool) {
-	c.mu.Lock()
-	if !c.admissionOpen {
-		c.mu.Unlock()
+	if !c.admit(r) {
 		return noopRelease, false
 	}
-	c.holds[r]++
-	c.total++
-	c.mu.Unlock()
 
 	// One sync.Once per returned closure, never one per reason: two holds on one
 	// reason are two counts and two independent releases, so a per-reason guard
 	// would let the first release swallow the second hold's count and strand the
-	// coordinator waiting for work that had finished.
+	// coordinator waiting for work that had finished. It is allocated outside
+	// the critical section because nothing under the lock depends on it.
 	var once sync.Once
 	return func() { once.Do(func() { c.releaseHold(r) }) }, true
+}
+
+// admit is Acquire's critical section: it reads the admission flag and
+// increments the counters under one acquisition of c.mu, and reports whether the
+// hold was granted.
+//
+// It is a function of its own, with a deferred unlock, rather than an inline
+// section with two explicit unlocks. Both are correct today, but this is the
+// section the sequence races: an implementation that read the flag, dropped the
+// lock and then incremented would grant holds the cut has already snapshotted
+// past, which TestAdmissionCutoffAndSnapshotAreOneCriticalSection exists to
+// catch. Code that will grow — Task 11 adds the idle generation bump on the
+// zero→nonzero transition, here, inside this same section — should not grow
+// around a hand-balanced unlock, where an inserted early return leaks the mutex.
+//
+// The name deviates from the -Locked suffix used elsewhere in this file
+// (holdsLocked) on purpose: that suffix means the caller must already hold the
+// lock, and this takes it.
+func (c *Coordinator) admit(r Reason) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.admissionOpen {
+		return false
+	}
+	c.holds[r]++
+	c.total++
+	return true
 }
 
 // releaseHold decrements one hold of reason r. It is only ever reached through a
@@ -253,6 +305,14 @@ func (c *Coordinator) releaseHold(r Reason) {
 		// a map that only ever grew would keep every reason the process has
 		// ever used alive for the life of the coordinator.
 		delete(c.holds, r)
+	}
+
+	// The wait phase's exit condition. drained is nil until the cut installs it
+	// and again once it has fired, so a release before the drain, or after the
+	// sequence has already ended, simply decrements.
+	if c.total == 0 && c.drained != nil {
+		close(c.drained)
+		c.drained = nil
 	}
 }
 
@@ -345,6 +405,10 @@ func (c *Coordinator) begin(cause Cause) bool {
 	}
 	c.draining = true
 	c.cause = cause
+	// Read under the lock, alongside the flags it belongs with. Taking c.mu and
+	// then the clock's is the module's only lock order and it has no reverse
+	// edge: draintest runs timer callbacks with its own lock released.
+	c.beganAt = c.cfg.clock.Now()
 
 	// The admission flag is NOT the draining flag. A signal drain is draining
 	// with admission still open, because endpoint withdrawal is asynchronous and
@@ -359,6 +423,9 @@ func (c *Coordinator) begin(cause Cause) bool {
 	if cause != CauseSignal {
 		c.admissionOpen = false
 	}
+
+	// Released last, so a Wait woken by it observes a fully recorded sequence.
+	close(c.begun)
 	return true
 }
 
