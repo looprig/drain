@@ -34,6 +34,7 @@ const (
 const (
 	reasonTurn Reason = "drain_test/active_turn"
 	reasonGate Reason = "drain_test/pending_gate"
+	reasonProc Reason = "drain_test/subprocess"
 )
 
 // Reason is aliased so the reason constants above read as they would in a
@@ -54,12 +55,49 @@ const (
 	// phaseSettle is Wait inside the settle window: the settle timer is armed
 	// and, until Task 10, nothing else is.
 	phaseSettle phase = iota
+
+	// phaseWait is Wait inside the wait phase: the settle timer has fired, and
+	// one deadline timer is armed for every reason the cut named whose deadline
+	// had not already passed. A reason whose deadline is spent when the wait
+	// phase begins — a zero-deadline pending gate, or any deadline shorter than
+	// the settle window — arms nothing, so it is not counted.
+	phaseWait
 )
 
 // waitResult is one return from Wait, carried off the goroutine that made it.
 type waitResult struct {
 	out drain.Outcome
 	err error
+}
+
+// bubbled runs fn inside a testing/synctest bubble, handing it a context created
+// inside that bubble. Everything the test touches — the rig, its clock, its
+// goroutines — must be created inside fn: a channel the bubble does not own is
+// never durably blocking, so a goroutine selecting on a context from outside
+// would keep synctest.Wait from ever returning.
+//
+// Two things earn the bubble, and the second is why the wait-phase tests use it
+// by default where Task 7's did not. It supplies the happens-before edge that
+// rig.stillDraining needs to prove Wait has not returned. And it turns an
+// ordering bug into an immediate failure: when every goroutine is durably
+// blocked, synctest fails the test with a dump naming the timer that was never
+// armed, instead of hanging to the binary's ten-minute -timeout. A wait phase
+// whose deadlines are all driven by a fake clock has many ways to reach that
+// state and no other way to report it.
+//
+// draintest's doc comment names synctest as the alternative available to tests
+// inside drain, and declines to make it the exported mechanism, because
+// requiring a consumer to run its shutdown wiring inside a bubble is a
+// constraint this module has no standing to impose. That reasoning is about
+// draintest's contract, not about this suite.
+func bubbled(t *testing.T, fn func(t *testing.T, ctx context.Context)) {
+	t.Helper()
+
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		fn(t, ctx)
+	})
 }
 
 // rig couples a coordinator with the fake clock driving it, and owns the one
@@ -75,6 +113,14 @@ type rig struct {
 	settle time.Duration
 	done   chan waitResult
 
+	// waitTimers is how many per-reason deadline timers this test's holds
+	// produce, declared through armsInWait. It is rig state rather than a
+	// parameter of armedIn because it is a property of the holds a test takes
+	// and not of any phase but one: threading a reason count through reach and
+	// advance would make every settle-phase ordering point in the suite carry a
+	// number that means nothing there.
+	waitTimers int
+
 	*drain.Coordinator
 }
 
@@ -89,13 +135,21 @@ func newRig(t *testing.T, opts ...drain.Option) *rig {
 // parameter rather than one of opts on purpose: the rig can only own the timer
 // count if it knows the policy that produces the timers, so a WithPreDrainDelay
 // passed through opts would silently desynchronize armedIn from the coordinator.
+//
+// The rig's own options are appended LAST, so that last-option-wins gives the
+// rig the win rather than the caller. That is enforcement, not preference: an
+// opts-supplied WithPreDrainDelay would only mis-time the settle window, but an
+// opts-supplied WithClock would leave r.clock advancing a clock the coordinator
+// never reads, so every reach in the suite would block on an arm that can never
+// happen. Documenting the rule and then letting opts override it puts a hang one
+// typo away.
 func newRigWithSettle(t *testing.T, settle time.Duration, opts ...drain.Option) *rig {
 	t.Helper()
 
 	clock := draintest.NewClock(epoch)
 	all := make([]drain.Option, 0, len(opts)+2)
-	all = append(all, drain.WithClock(clock), drain.WithPreDrainDelay(settle))
 	all = append(all, opts...)
+	all = append(all, drain.WithClock(clock), drain.WithPreDrainDelay(settle))
 
 	c, err := drain.New(testGrace, all...)
 	if err != nil {
@@ -119,11 +173,32 @@ func (r *rig) armedIn(p phase) int {
 	n := 0
 	// The settle timer. A non-positive window arms nothing at all — the
 	// sequence dispatches straight to the cut rather than arming a timer the
-	// fake clock would never fire — so the count is zero there.
+	// fake clock would never fire — so the count is zero there. Neither does a
+	// window whose remainder is already spent at Wait entry, which is why
+	// TestSettleWindowAlreadyElapsedAtWaitEntry never reaches a phase.
 	if p == phaseSettle && r.settle > 0 {
 		n++
 	}
+	// The per-reason deadline timers, one per reason still owed a deadline at
+	// the cut. The settle timer has fired by then and is no longer armed.
+	if p == phaseWait {
+		n += r.waitTimers
+	}
 	return n
+}
+
+// armsInWait declares how many per-reason deadline timers the coordinator arms
+// when this test's drain enters the wait phase. Call it before the first
+// reach(phaseWait); it is the one number a wait-phase test supplies, and it
+// supplies it here rather than to a BlockUntil of its own.
+//
+// Count the reasons outstanding at the cut whose deadline has NOT already
+// passed. A spent deadline arms nothing, so counting it blocks reach forever;
+// under a synctest bubble that is an immediate failure rather than a hang, which
+// is why the wait-phase tests run inside one.
+func (r *rig) armsInWait(n int) {
+	r.t.Helper()
+	r.waitTimers = n
 }
 
 // start runs Wait on its own goroutine and keeps its return for result.
@@ -172,6 +247,48 @@ func (r *rig) grants(reason Reason) bool {
 	}
 	release()
 	return ok
+}
+
+// mustAcquire takes a hold that the test's setup requires to be granted, and
+// returns its release. A refusal here is a broken premise rather than the
+// assertion under test, so it fails the test on the spot.
+func (r *rig) mustAcquire(reason Reason) func() {
+	r.t.Helper()
+
+	release, ok := r.Acquire(reason)
+	if !ok {
+		r.t.Fatalf("Acquire(%q) refused, want granted: admission is open until the cut", reason)
+	}
+	return release
+}
+
+// stillDraining asserts that Wait has NOT returned. It is only sound inside a
+// synctest bubble: proving an absence needs a happens-before edge, and
+// synctest.Wait supplies it by returning only once every other goroutine is
+// durably blocked, so a Wait that was going to return already has. Outside a
+// bubble the same non-blocking receive passes for an implementation that simply
+// had not been scheduled yet.
+func (r *rig) stillDraining(why string) {
+	r.t.Helper()
+
+	synctest.Wait()
+	select {
+	case res := <-r.done:
+		r.t.Fatalf("Wait() returned %+v, want it still draining: %s", res, why)
+	default:
+	}
+}
+
+// armed asserts the number of timers the coordinator currently has armed. Every
+// caller has already ordered itself against the arming through reach; this
+// reports what happened to those timers afterwards, which is how a deadline's
+// arithmetic is observed before phase 5 has anything to say.
+func (r *rig) armed(want int, why string) {
+	r.t.Helper()
+
+	if got := r.clock.Armed(); got != want {
+		r.t.Fatalf("Armed() = %d, want %d: %s", got, want, why)
+	}
 }
 
 // result blocks for Wait's return. It has no timeout of its own, following
@@ -599,6 +716,45 @@ func TestZeroSettleWindowCutsWithoutArmingATimer(t *testing.T) {
 	if r.grants(reasonTurn) {
 		t.Error("Acquire granted after a zero-length settle window, want refused")
 	}
+}
+
+// TestSettleWindowAlreadyElapsedAtWaitEntry is the OTHER half of the plan's
+// third rule, and it is a different bug from the one above rather than a second
+// phrasing of it.
+//
+// TestZeroSettleWindowCutsWithoutArmingATimer covers a window configured at
+// zero. This covers a window configured positive whose remainder is already
+// spent, because Begin preceded Wait entry by more than the window — a signal
+// that arrived while the process was still starting up. The remainder is then
+// NEGATIVE, and a guard written against the policy (preDrainDelay <= 0) instead
+// of against the remainder (remaining <= 0) passes the zero case and arms a
+// timer for a deadline in the past here. The fake clock fires such a timer only
+// on an explicit Advance, which the sequence has no reason to make, so the
+// mutation hangs rather than fails — inside the bubble, immediately and with a
+// goroutine dump.
+func TestSettleWindowAlreadyElapsedAtWaitEntry(t *testing.T) {
+	t.Parallel()
+
+	bubbled(t, func(t *testing.T, ctx context.Context) {
+		const elapsed = testSettle + 2*time.Second
+
+		r := newRig(t)
+		r.Begin(drain.CauseSignal)
+		// Nothing is armed before Wait entry, so this advance needs no ordering.
+		r.clock.Advance(elapsed)
+		r.start(ctx)
+
+		// No further advance: the window is spent, so the sequence must cut and
+		// return on its own.
+		out := r.completed(drain.CauseSignal)
+		r.armed(0, "a settle window already spent at Wait entry must not arm a timer")
+		if out.Duration != elapsed {
+			t.Errorf("Outcome.Duration = %v, want %v", out.Duration, elapsed)
+		}
+		if r.grants(reasonTurn) {
+			t.Error("Acquire granted after a spent settle window, want refused")
+		}
+	})
 }
 
 // TestWaitBlocksUntilOutstandingHoldsRelease is the positive statement of phase

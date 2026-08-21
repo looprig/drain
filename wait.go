@@ -2,6 +2,8 @@ package drain
 
 import (
 	"context"
+	"maps"
+	"slices"
 	"time"
 )
 
@@ -51,14 +53,9 @@ func (c *Coordinator) Wait(ctx context.Context) (Outcome, error) {
 	// Phases 2 and 3, settle and the admission cutoff.
 	cut, cancelled := c.settle(ctx, beganAt)
 
-	// Phase 4, the wait. Per-reason deadlines are Task 8 and abandonment is
-	// Task 9; for now the sequence waits for everything the cutoff named.
-	if !cancelled && len(cut.outstanding) > 0 {
-		select {
-		case <-cut.drained:
-		case <-ctx.Done():
-			cancelled = true
-		}
+	// Phases 4 and 5, the wait and abandonment.
+	if !cancelled {
+		cancelled = c.awaitHolds(ctx, cut, beganAt)
 	}
 
 	out := Outcome{Cause: cause, Duration: c.cfg.clock.Now().Sub(beganAt)}
@@ -172,3 +169,98 @@ func (c *Coordinator) cutAdmission() cutoff {
 	}
 	return c.cutoff
 }
+
+// awaitHolds runs phase 4, the wait. Every reason the cutoff named is given
+// until its own deadline, and the reasons run CONCURRENTLY rather than in
+// series: the worst case across them is max, not sum, which is what lets New
+// validate each deadline against the grace period one at a time.
+//
+// A deadline does not end the wait. Reaching one is the instant the owner is
+// told (phase 5), after which drain keeps waiting for those holds until they
+// release or the ceiling expires — that is what makes interrupt-then-drain work,
+// and what keeps Abandoned from over-reporting work the owner successfully
+// abandoned. So the wait ends when the last hold releases, or when ctx is done;
+// the ceiling that bounds it otherwise is Task 10.
+//
+// It reports whether ctx cancelled the wait.
+func (c *Coordinator) awaitHolds(ctx context.Context, cut cutoff, beganAt time.Time) bool {
+	if len(cut.outstanding) == 0 {
+		return false
+	}
+
+	stop := c.armDeadlines(cut, beganAt)
+	defer stop()
+
+	select {
+	case <-cut.drained:
+		return false
+	case <-ctx.Done():
+		return true
+	}
+}
+
+// armDeadlines starts phase 4's per-reason deadlines and returns a function that
+// stops whichever are still armed when the wait ends. A deadline that never came
+// due is stopped rather than left to fire against a spent coordinator.
+//
+// Elapsed time is read ONCE, for every reason, so that the reason this loop
+// reaches last cannot be handed a longer budget than the one it reached first.
+// Reasons are visited in sorted order for the same kind of reason validation is:
+// the immediate dispatches below are the visible half of this loop, and a map's
+// order would make which of two spent deadlines is reported first differ run to
+// run.
+func (c *Coordinator) armDeadlines(cut cutoff, beganAt time.Time) func() {
+	elapsed := c.cfg.clock.Now().Sub(beganAt)
+
+	timers := make([]Timer, 0, len(cut.outstanding))
+	for _, r := range slices.Sorted(maps.Keys(cut.outstanding)) {
+		// The remainder, not the policy. A deadline is measured from Begin and
+		// overlaps the settle window, so a reason admitted three seconds into a
+		// five-second settle under a ten-second deadline has five seconds left
+		// here, not ten: the budget belongs to the process, not to the request.
+		//
+		// Which makes a non-positive remainder ordinary rather than exceptional
+		// — a zero-deadline pending gate is spent before the sequence starts,
+		// and any deadline shorter than the settle window is spent by the cut —
+		// and it is dispatched directly. Arming a timer for it would be the
+		// literal wrong thing twice over: the spec says such a deadline fires
+		// immediately, and a fake clock runs a non-positive timer only on an
+		// explicit Advance, so a drain that armed one would hang rather than
+		// fail in every deterministic test its consumers write.
+		remaining := c.deadlineFor(r) - elapsed
+		if remaining <= 0 {
+			c.abandon(r)
+			continue
+		}
+		timers = append(timers, c.cfg.clock.AfterFunc(remaining, func() { c.abandon(r) }))
+	}
+
+	return func() {
+		for _, timer := range timers {
+			timer.Stop()
+		}
+	}
+}
+
+// deadlineFor reports the deadline drain applies to reason r: the one the caller
+// configured, or the full grace period for a reason nobody configured. The
+// cautious default is the one you get by doing nothing, which is what makes a
+// misspelled WithDeadline survivable — the real reason keeps waiting instead of
+// inheriting the typo's policy — and Outcome.Waited is what makes it visible.
+func (c *Coordinator) deadlineFor(r Reason) time.Duration {
+	if d, ok := c.cfg.deadlines[r]; ok {
+		return d
+	}
+	return c.gracePeriod
+}
+
+// abandon is phase 5 for one reason: the point at which its deadline has passed
+// with holds still outstanding. Task 9 fills it in — the re-check under the lock
+// that skips a reason whose count reached zero, and OnDeadline on a
+// coordinator-owned goroutine.
+//
+// It is already the single point both ways a deadline can pass converge on: a
+// timer that came due, and a deadline that was spent before the wait phase began.
+// Keeping them one path is what makes the zero-deadline case ordinary code
+// rather than a special case bolted onto phase 5 later.
+func (c *Coordinator) abandon(r Reason) {}
