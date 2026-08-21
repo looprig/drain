@@ -80,8 +80,8 @@ func (c *Coordinator) Wait(ctx context.Context) (Outcome, error) {
 	// budget rather than a fresh one — the platform's countdown started at
 	// Begin whatever this process was doing at the time.
 	callbackCtx, cancelCallbacks := c.callbackContext(ctx, beganAt)
-	defer cancelCallbacks()
-	ceiling, stopCeiling := c.armCeiling(beganAt, cancelCallbacks)
+	defer cancelCallbacks(nil)
+	ceiling, stopCeiling := c.armCeiling(beganAt, func() { cancelCallbacks(context.DeadlineExceeded) })
 	defer stopCeiling()
 
 	// Phase 1, quiesce.
@@ -95,13 +95,28 @@ func (c *Coordinator) Wait(ctx context.Context) (Outcome, error) {
 		how = c.awaitHolds(ctx, callbackCtx, ceiling, cut, beganAt)
 	}
 
-	// The ceiling is not a quiet exit. Phase 5 owes a report to every reason
-	// still outstanding that has not had one, and at the ceiling that set is
-	// never reliably empty: an unconfigured reason waits the full grace period,
-	// so its deadline and the ceiling are the same instant and which timer the
-	// clock reaches first is not a property worth depending on. abandon is
-	// once-per-reason, so a reason already told is not told twice.
-	if how == endedCeiling {
+	// Neither of the two ways a drain can end early is a quiet exit. Phase 5
+	// owes a report to every reason still outstanding that has not had one, and
+	// that set is never reliably empty on either path: at the ceiling because an
+	// unconfigured reason waits the full grace period, so its deadline and the
+	// ceiling are the same instant and which timer the clock reaches first is
+	// not a property worth depending on; and on cancellation because the wait
+	// phase was cut short, so most reasons never reached a deadline at all.
+	//
+	// A cancelled drain abandons work exactly as an overrun does, and the owner
+	// is owed the same report — the alternative is a process that walks away
+	// from in-flight work silently. abandon is once-per-reason, so a reason
+	// already told at its own deadline is not told again here.
+	//
+	// The callback context is cancelled BEFORE the sweep rather than left to the
+	// path that got here, and that ordering is the contract: on both paths the
+	// budget is gone by definition, so the invocation is a notification that
+	// abandonment happened rather than an invitation to do work inside a ctx
+	// that is about to die anyway. Doing it here makes it true at the callback's
+	// first statement instead of true shortly afterwards, which is the
+	// difference between a documented property and a race.
+	if how != endedComplete {
+		cancelCallbacks(endingCause(how, ctx))
 		c.abandonRemaining(callbackCtx)
 	}
 
@@ -155,13 +170,45 @@ func (c *Coordinator) Wait(ctx context.Context) (Outcome, error) {
 // when it expires first: a derived context may never outlive its parent's
 // deadline, and reporting one that does would make every context.WithTimeout
 // built on top of this one wrong.
-func (c *Coordinator) callbackContext(ctx context.Context, beganAt time.Time) (context.Context, context.CancelFunc) {
-	base, cancel := context.WithCancel(ctx)
+//
+// # Why the cause matters
+//
+// A clock-driven expiry cannot go through context.WithDeadline, so Err() on
+// this context is context.Canceled even when the ceiling is what ended it — and
+// a context that reports a deadline invites exactly the check that then reads
+// wrong, errors.Is(ctx.Err(), context.DeadlineExceeded). The two situations the
+// owner has to tell apart are the ceiling expiring, where the process is out of
+// budget and must exit, and Wait's own ctx being cancelled, where the drain was
+// called off from outside. So the cancellation carries a CAUSE:
+// context.DeadlineExceeded at the ceiling, and Wait's ctx's own cause on the
+// cancellation path. context.Cause discriminates them, ctx.Err() alone cannot,
+// and WithOnDeadline documents which of the two to read.
+func (c *Coordinator) callbackContext(ctx context.Context, beganAt time.Time) (context.Context, context.CancelCauseFunc) {
+	base, cancel := context.WithCancelCause(ctx)
 	expiry := beganAt.Add(c.gracePeriod)
 	if parent, ok := ctx.Deadline(); ok && !parent.After(expiry) {
 		return base, cancel
 	}
 	return ceilingContext{Context: base, deadline: expiry}, cancel
+}
+
+// endingCause reports the cause to cancel the callback context with when the
+// sequence ended early. Only the two early endings reach it: a completed drain
+// tears its context down with a nil cause, which is the ordinary "this is over"
+// rather than a claim about why.
+//
+// The cancellation path forwards Wait's ctx's own cause rather than minting
+// one, so an owner that cancelled with context.WithCancelCause sees its own
+// reason at the callback instead of a generic one. It is usually redundant —
+// the parent's cancellation has normally already propagated by the time this
+// runs, and the first cancellation wins — but that propagation is asynchronous
+// for a context the caller implemented itself, so whichever of the two lands
+// first has to record the same thing.
+func endingCause(how ended, ctx context.Context) error {
+	if how == endedCeiling {
+		return context.DeadlineExceeded
+	}
+	return context.Cause(ctx)
 }
 
 // ceilingContext is a cancellable context that reports the grace ceiling as its

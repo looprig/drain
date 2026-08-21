@@ -66,6 +66,27 @@ func (rec *recorder) next(reason Reason, outstanding int) {
 	}
 }
 
+// took blocks for n invocations and returns them keyed by reason, failing if
+// any reason is reported twice.
+//
+// It is next for the case where several reasons are reported at the SAME
+// instant — the ceiling's sweep and the cancellation sweep both dispatch every
+// outstanding reason at once, on a goroutine each, so the order the calls
+// arrive in is a race by design and only the set of them is a property.
+func (rec *recorder) took(n int) map[Reason]int {
+	rec.t.Helper()
+
+	got := make(map[Reason]int, n)
+	for range n {
+		call := <-rec.calls
+		if _, duplicate := got[call.reason]; duplicate {
+			rec.t.Errorf("OnDeadline fired twice for %q, want once per reason", call.reason)
+		}
+		got[call.reason] = call.outstanding
+	}
+	return got
+}
+
 // none asserts that no invocation has happened. It is only sound inside a
 // bubble: synctest.Wait returns once every other goroutine is durably blocked,
 // so a callback that was going to be dispatched already has been.

@@ -101,6 +101,14 @@ func WithOnQuiesce(fn func(cause Cause)) Option {
 // expired with holds still outstanding, on coordinator-owned goroutines,
 // possibly concurrently for different reasons. ctx expires at the grace ceiling.
 //
+// Read context.Cause(ctx), not ctx.Err(), to tell the two endings apart. The
+// ceiling is driven by the injected Clock rather than by context.WithDeadline,
+// so Err() is context.Canceled whichever way the sequence ended; the cause is
+// context.DeadlineExceeded when the grace ceiling expired, and Wait's own ctx's
+// cause when the drain was called off from outside. On that second path the ctx
+// is already done at the invocation — the call is a notification that
+// abandonment happened, not a budget to work within.
+//
 // It returns nothing: the callback cannot extend the wait, because the ceiling
 // exists precisely because SIGKILL does not negotiate. A legitimate need for
 // more time is already spelled WithDeadline(r, longer). outstanding is a

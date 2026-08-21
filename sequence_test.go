@@ -440,6 +440,26 @@ func (r *rig) exceeded(wantCause drain.Cause) (drain.Outcome, *drain.GracePeriod
 	return res.out, overrun
 }
 
+// cancelled is result with the assertion the cancellation path makes: a valid
+// Outcome AND ctx.Err(), because a drain that was told to stop mid-flight is
+// the one whose telemetry an operator most needs — work was abandoned without
+// any deadline having been reached.
+//
+// The cause is asserted rather than assumed to be CauseContext: a cancellation
+// implies Begin, so it records CauseContext only when nothing else had.
+func (r *rig) cancelled(wantCause drain.Cause) drain.Outcome {
+	r.t.Helper()
+
+	res := r.result()
+	if !errors.Is(res.err, context.Canceled) {
+		r.t.Fatalf("Wait() = _, %v, want context.Canceled", res.err)
+	}
+	if res.out.Cause != wantCause {
+		r.t.Errorf("Outcome.Cause = %v, want %v", res.out.Cause, wantCause)
+	}
+	return res.out
+}
+
 // completed is result with the assertion every clean drain makes.
 func (r *rig) completed(wantCause drain.Cause) drain.Outcome {
 	r.t.Helper()

@@ -20,6 +20,7 @@ package drain_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -477,6 +478,19 @@ func TestCallbackContextExpiresAtTheCeiling(t *testing.T) {
 			r.exceeded(drain.CauseSignal)
 			if err := cbctx.Err(); err == nil {
 				t.Error("callback ctx Err() = nil after the ceiling expired, want non-nil")
+			}
+
+			// Err() cannot say WHY, and it never will on this context: the
+			// ceiling is driven by the injected Clock, so the cancellation
+			// cannot go through context.WithDeadline and Err() is
+			// context.Canceled here exactly as it is when Wait's own ctx is
+			// cancelled. A context that reports a Deadline invites the check
+			// that then reads wrong — errors.Is(ctx.Err(), DeadlineExceeded) —
+			// and the two endings need different responses from the owner, so
+			// the discrimination is carried as the cancellation's cause.
+			if cause := context.Cause(cbctx); !errors.Is(cause, context.DeadlineExceeded) {
+				t.Errorf("context.Cause(callback ctx) = %v after the ceiling expired, want context.DeadlineExceeded: "+
+					"the owner cannot tell an overrun from a cancelled Wait through Err() alone", cause)
 			}
 		})
 	})
