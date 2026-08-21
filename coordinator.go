@@ -65,9 +65,12 @@ type Coordinator struct {
 	// boundary.
 	admissionOpen bool
 
-	// draining reports whether the sequence has begun. It is written once, by
-	// the Begin that transitions it from false to true.
+	// draining reports whether the sequence has begun, and cause is the first
+	// cause recorded. Both are written once, by the Begin that transitions
+	// draining from false to true, which is what makes Outcome.Cause
+	// deterministic under a race between a signal and the idle timer.
 	draining bool
+	cause    Cause
 }
 
 // New returns a Coordinator whose sequence is bounded by gracePeriod, measured
@@ -287,4 +290,82 @@ func (c *Coordinator) holdsLocked() map[Reason]int {
 		return nil
 	}
 	return snapshot
+}
+
+// Begin records the cause and starts the sequence. The first cause wins; later
+// calls are no-ops including their cause, so Outcome.Cause is deterministic.
+//
+// The valid arguments are CauseSignal, CauseIdle, CauseExplicit, and
+// CauseContext. Any other value — including CauseUnknown, which names the
+// not-yet-started state and is never a valid argument — is recorded as
+// CauseExplicit: that is the literal truth (Begin was called directly), and it
+// takes the fail-secure admission path, closing admission at Begin rather than
+// inheriting CauseSignal's open settle window. CauseUnknown is therefore never
+// observable on a started sequence.
+//
+// Begin does not panic on an out-of-range cause. It is called from signal
+// handlers and shutdown paths, and a graceful-termination coordinator that kills
+// the process over a taxonomy slip has failed at its one job.
+//
+// Begin returns promptly and never runs a user callback on its caller's
+// goroutine — the sequence executes inside Wait, which proceeds immediately if
+// entered after Begin.
+func (c *Coordinator) Begin(cause Cause) {
+	c.begin(cause)
+}
+
+// begin is Begin's critical section, reporting whether this call is the one that
+// started the sequence. The sequence itself needs that answer — the idle timer
+// and a cancelled context both call it speculatively, and only the caller that
+// wins may act as though it started a drain — while Begin's public contract is
+// simply that it is a no-op the second time.
+//
+// The cause, the draining flag, and the admission flag are written in ONE
+// critical section. They are three decisions from one fact, and an Acquire that
+// observed the admission flag of a drain whose cause had not been recorded yet
+// would be reading a state the coordinator was never in.
+func (c *Coordinator) begin(cause Cause) bool {
+	cause = normalizeCause(cause)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.draining {
+		return false
+	}
+	c.draining = true
+	c.cause = cause
+
+	// The admission flag is NOT the draining flag. A signal drain is draining
+	// with admission still open, because endpoint withdrawal is asynchronous and
+	// requests routed here before the signal arrived are still arriving:
+	// refusing them immediately turns a graceful shutdown into a burst of 503s.
+	// Its cutoff comes later, at the settle boundary. Every other cause is
+	// self-inflicted — nothing external is still routing work here — so
+	// admission closes now.
+	//
+	// Written as a close rather than an assignment: admission is a one-way
+	// latch, and a later Begin must never be able to reopen it.
+	if cause != CauseSignal {
+		c.admissionOpen = false
+	}
+	return true
+}
+
+// normalizeCause maps every value outside the set of valid Begin arguments onto
+// CauseExplicit, which is both the literal truth about such a call and the
+// fail-secure choice: the alternative — treating an unrecognized cause as a
+// signal — would hand an unknown caller the one path that keeps admission open.
+//
+// CauseUnknown is normalized like any other invalid value rather than special
+// cased, because its meaning is "the sequence has not started"; recording it on
+// a sequence that has started would make Draining and Outcome.Cause contradict
+// each other.
+func normalizeCause(cause Cause) Cause {
+	switch cause {
+	case CauseSignal, CauseIdle, CauseExplicit, CauseContext:
+		return cause
+	default:
+		return CauseExplicit
+	}
 }
