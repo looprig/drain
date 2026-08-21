@@ -3,6 +3,8 @@ package draintest_test
 import (
 	"context"
 	"errors"
+	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -739,4 +741,164 @@ func TestFakeClockAdvanceRejectsNegative(t *testing.T) {
 		}
 	}()
 	draintest.NewClock(epoch).Advance(-time.Second)
+}
+
+// TestFakeClockAdvanceRunsTimersChainedFromCallbacks pins the half of Advance's
+// contract that says "a callback that arms a further timer due inside the same
+// window runs in this same Advance". Nothing exercised it: the arming case in
+// TestFakeClockArmed chains an hour-long timer against a one-second advance, so
+// the chained timer is correctly left armed and the chaining itself never runs.
+//
+// Two drain mechanisms are about to depend on this. Task 8 arms one deadline
+// timer per outstanding reason from inside the wait phase, and Task 11 re-arms
+// the idle timer from inside the callback that just fired — a re-arm with a
+// non-positive remaining budget is the zero-duration case below. An Advance that
+// stopped at the timers armed when it was entered would leave both waiting for
+// an advance the coordinator has no reason to make, which is a hang rather than
+// a failure.
+func TestFakeClockAdvanceRunsTimersChainedFromCallbacks(t *testing.T) {
+	t.Parallel()
+
+	// chain records firing order and the time each callback observed, which is
+	// the second half of the claim: a chained callback must see its own
+	// deadline, not the end of the advance.
+	type chain struct {
+		mu    sync.Mutex
+		order []string
+		seen  map[string]time.Time
+	}
+	record := func(clock *draintest.Clock, c *chain, name string) func() {
+		return func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.order = append(c.order, name)
+			c.seen[name] = clock.Now()
+		}
+	}
+	newChain := func() *chain { return &chain{seen: map[string]time.Time{}} }
+
+	assertOrder := func(t *testing.T, got, want []string) {
+		t.Helper()
+		if !slices.Equal(got, want) {
+			t.Fatalf("callbacks fired %v, want %v", got, want)
+		}
+	}
+
+	t.Run("a chained timer due inside the window runs in the same Advance", func(t *testing.T) {
+		t.Parallel()
+
+		clock := draintest.NewClock(epoch)
+		c := newChain()
+
+		// first fires at +1s and arms second for +1s more, which is +2s: still
+		// inside the three-second window this Advance covers.
+		clock.AfterFunc(time.Second, func() {
+			record(clock, c, "first")()
+			clock.AfterFunc(time.Second, record(clock, c, "second"))
+		})
+
+		clock.Advance(3 * time.Second)
+
+		assertOrder(t, c.order, []string{"first", "second"})
+		if got, want := c.seen["second"], epoch.Add(2*time.Second); !got.Equal(want) {
+			t.Errorf("chained callback saw Now() = %v, want its own deadline %v", got, want)
+		}
+		if got, want := clock.Now(), epoch.Add(3*time.Second); !got.Equal(want) {
+			t.Errorf("Now() after Advance = %v, want %v", got, want)
+		}
+		if got := clock.Armed(); got != 0 {
+			t.Errorf("Armed() = %d after the window covered both timers, want 0", got)
+		}
+	})
+
+	t.Run("a chained timer due past the window is left armed", func(t *testing.T) {
+		t.Parallel()
+
+		clock := draintest.NewClock(epoch)
+		c := newChain()
+
+		// The boundary case for the rule above: the chained timer is armed at
+		// +1s for +5s, so it is due at +6s and this three-second window must not
+		// reach it. It must be armed, not lost.
+		clock.AfterFunc(time.Second, func() {
+			record(clock, c, "first")()
+			clock.AfterFunc(5*time.Second, record(clock, c, "late"))
+		})
+
+		clock.Advance(3 * time.Second)
+
+		assertOrder(t, c.order, []string{"first"})
+		if got := clock.Armed(); got != 1 {
+			t.Fatalf("Armed() = %d after the chained timer's deadline fell outside the window, want 1", got)
+		}
+
+		clock.Advance(3 * time.Second)
+		assertOrder(t, c.order, []string{"first", "late"})
+		if got, want := c.seen["late"], epoch.Add(6*time.Second); !got.Equal(want) {
+			t.Errorf("chained callback saw Now() = %v, want its own deadline %v", got, want)
+		}
+	})
+
+	t.Run("a zero-duration timer armed from a callback runs in the same Advance", func(t *testing.T) {
+		t.Parallel()
+
+		clock := draintest.NewClock(epoch)
+		c := newChain()
+
+		clock.AfterFunc(time.Second, func() {
+			record(clock, c, "first")()
+			clock.AfterFunc(0, record(clock, c, "immediate"))
+		})
+
+		clock.Advance(time.Second)
+
+		assertOrder(t, c.order, []string{"first", "immediate"})
+		// The advance stops exactly at the parent's deadline, so the chained
+		// timer is due at the instant the clock has already reached. It must run
+		// anyway: this is the shape of a re-armed timer whose remaining budget
+		// has already elapsed.
+		if got, want := c.seen["immediate"], epoch.Add(time.Second); !got.Equal(want) {
+			t.Errorf("chained callback saw Now() = %v, want %v", got, want)
+		}
+		if got := clock.Armed(); got != 0 {
+			t.Errorf("Armed() = %d, want 0", got)
+		}
+	})
+
+	t.Run("a chain of zero-duration timers drains in one Advance", func(t *testing.T) {
+		t.Parallel()
+
+		const depth = 8
+		clock := draintest.NewClock(epoch)
+		c := newChain()
+
+		// Each link arms the next with d == 0, which is what a coordinator does
+		// when it re-arms a timer whose budget is already spent. A loop that ran
+		// only the timers armed on entry would fire one link and hang on the
+		// rest.
+		var arm func(n int)
+		arm = func(n int) {
+			clock.AfterFunc(0, func() {
+				record(clock, c, "link"+strconv.Itoa(n))()
+				if n+1 < depth {
+					arm(n + 1)
+				}
+			})
+		}
+		arm(0)
+
+		clock.Advance(0)
+
+		want := make([]string, depth)
+		for i := range want {
+			want[i] = "link" + strconv.Itoa(i)
+		}
+		assertOrder(t, c.order, want)
+		if got := clock.Now(); !got.Equal(epoch) {
+			t.Errorf("Now() = %v after Advance(0), want %v", got, epoch)
+		}
+		if got := clock.Armed(); got != 0 {
+			t.Errorf("Armed() = %d after the chain drained, want 0", got)
+		}
+	})
 }

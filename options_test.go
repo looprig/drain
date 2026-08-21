@@ -11,6 +11,10 @@ package drain
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"maps"
 	"os"
 	"slices"
 	"strconv"
@@ -484,14 +488,141 @@ func TestNewIgnoresNilOption(t *testing.T) {
 	}
 }
 
+// optionConstructors is every exported function in this package that returns an
+// Option, paired with an invocation that carries a value. It is the registry the
+// no-defensive-copy reasoning in New rests on: that reasoning is a property of
+// the current option set rather than of New, so it has to be re-checked whenever
+// the set grows, and a check that names one option checks one option.
+//
+// TestOptionConstructorsAreAllRegistered fails when a new constructor is not
+// added here, and TestNewDoesNotShareStateAcrossCoordinators then builds two
+// coordinators from the whole registry and asserts neither can mutate the
+// other's policy. The pair is what makes the claim general: the earlier version
+// of this test exercised WithDeadline alone, so a hypothetical
+// WithDeadlines(map[Reason]time.Duration) that assigned the caller's map
+// straight into cfg aliased it into every coordinator built from it and the
+// suite still passed.
+//
+// Every value here must be legal for the grace period the sharing test uses.
+var optionConstructors = map[string]Option{
+	"WithPreDrainDelay": WithPreDrainDelay(time.Second),
+	"WithIdleTimeout":   WithIdleTimeout(time.Second),
+	"WithDeadline":      WithDeadline(registeredReason, time.Second),
+	"WithOnQuiesce":     WithOnQuiesce(func(Cause) {}),
+	"WithOnDeadline":    WithOnDeadline(func(context.Context, Reason, int) {}),
+	"WithSignals":       WithSignals(syscall.SIGTERM, syscall.SIGINT),
+	"WithClock":         WithClock(stubClock{name: "registered"}),
+}
+
+// registeredReason is the reason the registry's WithDeadline entry configures.
+const registeredReason Reason = "drain/registered"
+
+// registeredOptions returns every registered option in a deterministic order.
+// Order is irrelevant to what the sharing test asserts, but a set of options
+// that shuffled per run would make a failure hard to reproduce.
+func registeredOptions() []Option {
+	opts := make([]Option, 0, len(optionConstructors))
+	for _, name := range slices.Sorted(maps.Keys(optionConstructors)) {
+		opts = append(opts, optionConstructors[name])
+	}
+	return opts
+}
+
+// TestOptionConstructorsAreAllRegistered is the enforcement half of the pair. It
+// parses this package's own source for exported functions returning an Option
+// and requires the registry to name every one of them, so a new option cannot
+// quietly escape the sharing test the way a hand-maintained list would let it.
+//
+// go/ast rather than reflection because reflection cannot enumerate a package's
+// functions, and the whole point is to find the constructor nobody remembered.
+// Both are standard library, which this module's dependency rule requires.
+func TestOptionConstructorsAreAllRegistered(t *testing.T) {
+	t.Parallel()
+
+	declared := declaredOptionConstructors(t)
+	if len(declared) == 0 {
+		t.Fatal("found no exported Option constructors in the package source; the parser is not seeing this package")
+	}
+
+	for _, name := range declared {
+		if _, ok := optionConstructors[name]; !ok {
+			t.Errorf("%s returns an Option but is not in optionConstructors; add it, "+
+				"so TestNewDoesNotShareStateAcrossCoordinators covers it", name)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(optionConstructors)) {
+		if !slices.Contains(declared, name) {
+			t.Errorf("optionConstructors names %s, which is not an exported Option constructor in this package", name)
+		}
+	}
+}
+
+// declaredOptionConstructors reports the exported, receiverless functions in
+// this package's non-test files whose single result is an Option.
+func declaredOptionConstructors(t *testing.T) []string {
+	t.Helper()
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading the package directory: %v", err)
+	}
+
+	var names []string
+	fset := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		// ParseFile rather than the deprecated ParseDir, and declarations only:
+		// nothing here needs a function body.
+		file, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", name, err)
+		}
+		for _, decl := range file.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok && returnsOption(fn) {
+				names = append(names, fn.Name.Name)
+			}
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+// returnsOption reports whether fn is an exported package-level function whose
+// only result is an Option.
+func returnsOption(fn *ast.FuncDecl) bool {
+	if fn.Recv != nil || !fn.Name.IsExported() {
+		return false
+	}
+	results := fn.Type.Results
+	if results == nil || len(results.List) != 1 || len(results.List[0].Names) > 1 {
+		return false
+	}
+	ident, ok := results.List[0].Type.(*ast.Ident)
+	return ok && ident.Name == "Option"
+}
+
 // TestNewDoesNotShareStateAcrossCoordinators covers the composition root that
 // builds a []Option once and constructs from it twice. Each coordinator must own
-// its policy: the deadline map is the only reference type in it, and a shared
-// one would let a mutation of either coordinator's policy reach the other.
+// its policy: a shared reference would let a mutation of either coordinator's
+// policy — or of the caller's own value, still held after New returned — reach
+// the other.
+//
+// It is driven from optionConstructors rather than from one named option,
+// because the claim New relies on is about the option set as a whole. Funcs and
+// the Clock are deliberately excluded: they are behaviour the caller means to
+// share, not policy a coordinator owns.
 func TestNewDoesNotShareStateAcrossCoordinators(t *testing.T) {
 	t.Parallel()
 
-	opts := []Option{WithDeadline("r", time.Second)}
+	// A compile-time pin on config's field list, unkeyed on purpose: a new field
+	// breaks this line, which is the prompt to decide whether it is mutable
+	// state two coordinators could share and, if it is, to check it below.
+	var _ = config{0, 0, nil, nil, nil, nil, nil}
+
+	opts := registeredOptions()
 	first, err := New(30*time.Second, opts...)
 	if err != nil {
 		t.Fatalf("New() = %v, want a valid coordinator", err)
@@ -501,8 +632,22 @@ func TestNewDoesNotShareStateAcrossCoordinators(t *testing.T) {
 		t.Fatalf("New() = %v, want a valid coordinator", err)
 	}
 
-	first.cfg.deadlines["r"] = time.Hour
-	if got, want := second.cfg.deadlines["r"], time.Second; got != want {
-		t.Errorf("second coordinator's deadline for r = %v, want %v — the map is shared", got, want)
+	// The deadline map.
+	if got, want := second.cfg.deadlines[registeredReason], time.Second; got != want {
+		t.Fatalf("second coordinator's deadline for %q = %v, want %v", registeredReason, got, want)
+	}
+	first.cfg.deadlines[registeredReason] = time.Hour
+	if got, want := second.cfg.deadlines[registeredReason], time.Second; got != want {
+		t.Errorf("second coordinator's deadline for %q = %v after mutating the first's, want %v — the map is shared",
+			registeredReason, got, want)
+	}
+
+	// The signal slice.
+	if got, want := second.cfg.signals[0], os.Signal(syscall.SIGTERM); got != want {
+		t.Fatalf("second coordinator's first signal = %v, want %v", got, want)
+	}
+	first.cfg.signals[0] = syscall.SIGHUP
+	if got, want := second.cfg.signals[0], os.Signal(syscall.SIGTERM); got != want {
+		t.Errorf("second coordinator's first signal = %v after mutating the first's, want %v — the slice is shared", got, want)
 	}
 }

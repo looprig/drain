@@ -95,11 +95,21 @@ func New(gracePeriod time.Duration, opts ...Option) (*Coordinator, error) {
 		return nil, err
 	}
 
-	// No defensive copy of cfg.deadlines: WithDeadline builds its map inside the
-	// closure, against this call's own config, so two coordinators constructed
-	// from one []Option already have separate maps and nothing outside New ever
-	// held a reference to this one. TestNewDoesNotShareStateAcrossCoordinators
-	// pins that, so a future option that took a caller's map fails there.
+	// No defensive copy of cfg. Every option that writes a reference type builds
+	// it inside the closure, against this call's own config — WithDeadline its
+	// map, WithSignals its slice — so two coordinators constructed from one
+	// []Option already own separate copies and nothing outside New ever held a
+	// reference to either.
+	//
+	// That is a property of the current option set, not of New. An option that
+	// assigned a caller's map or slice straight into cfg would alias it into
+	// every coordinator built from it, and New would not notice. It is checked
+	// rather than assumed: optionConstructors in options_test.go registers every
+	// exported Option constructor, TestOptionConstructorsAreAllRegistered parses
+	// this package and fails when a new one is missing from it, and
+	// TestNewDoesNotShareStateAcrossCoordinators constructs two coordinators
+	// from the whole registry and asserts neither can mutate the other's
+	// policy. Registering a new option is therefore not optional.
 	return &Coordinator{
 		gracePeriod:   gracePeriod,
 		cfg:           cfg,

@@ -45,6 +45,13 @@ func defaultConfig() config {
 }
 
 // Option configures a Coordinator. Options record intent; New validates.
+//
+// An option that accepts a reference type from the caller — a map, a slice —
+// must copy it into the config rather than assign it, or the caller keeps a
+// handle on the policy of every coordinator built from that option. New makes
+// no defensive copy and relies on this. Every new constructor must be added to
+// optionConstructors in options_test.go, which is where that reliance is
+// checked; a completeness test fails if it is not.
 type Option func(*config)
 
 // WithPreDrainDelay sets the settle window. Default 5s, which suits a
