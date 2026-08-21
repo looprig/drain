@@ -429,6 +429,14 @@ func TestCancelReturnsValidOutcomeWithCtxErr(t *testing.T) {
 		if got := res.out.Abandoned[reasonTurn]; got != 1 {
 			t.Errorf("Outcome.Abandoned = %v, want %d hold of %q", res.out.Abandoned, 1, reasonTurn)
 		}
+		// Valid means complete. The cut runs on this path too, so the reason
+		// that was outstanding when admission closed is reported with the
+		// deadline it would have been given — a cancelled drain still tells the
+		// operator what policy was in force when it walked away.
+		want := map[Reason]time.Duration{reasonTurn: testGrace}
+		if !maps.Equal(res.out.Waited, want) {
+			t.Errorf("Outcome.Waited = %v, want %v", res.out.Waited, want)
+		}
 	})
 }
 

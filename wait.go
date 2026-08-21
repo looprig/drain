@@ -115,21 +115,34 @@ func (c *Coordinator) Wait(ctx context.Context) (Outcome, error) {
 	// that is about to die anyway. Doing it here makes it true at the callback's
 	// first statement instead of true shortly afterwards, which is the
 	// difference between a documented property and a race.
+	// Abandoned is what is still outstanding, snapshotted ONCE and snapshotted
+	// HERE, before phase 5's sweep dispatches anything. Every hold that reached
+	// a boundary has released by now, so what remains is exactly the work the
+	// process is walking away from — and it is exactly what the sweep below is
+	// about to be told about, which is the property the ordering buys.
+	//
+	// Reading the counters after the sweep would make the number depend on a
+	// goroutine race. The expected shape of abandonment is an owner whose
+	// OnDeadline interrupts work whose deferred release then runs on the
+	// callback's own goroutine, so a reason the sweep had just reported would
+	// appear or not appear according to what got scheduled first — two answers
+	// for one drain, reported to the same operator in the same return.
+	//
+	// Reasons configured with a zero deadline appear here on every drain by
+	// design, which is why an alert on Abandoned > 0 has to exclude the reasons
+	// Outcome.Waited reports at zero.
+	abandoned := c.Holds()
+
 	if how != endedComplete {
 		cancelCallbacks(endingCause(how, ctx))
 		c.abandonRemaining(callbackCtx)
 	}
 
-	// Abandoned is what is still outstanding now, snapshotted ONCE: every hold
-	// that reached a boundary has released by here, so what remains is exactly
-	// the work the process is walking away from. Reasons configured with a zero
-	// deadline appear on every drain by design, which is why an alert on
-	// Abandoned > 0 has to exclude the reasons Outcome.Waited reports at zero.
-	// Task 14 adds Waited.
 	out := Outcome{
 		Cause:     cause,
 		Duration:  c.cfg.clock.Now().Sub(beganAt),
-		Abandoned: c.Holds(),
+		Waited:    c.waited(cut),
+		Abandoned: abandoned,
 	}
 	switch how {
 	case endedCancelled:
@@ -469,6 +482,42 @@ func (c *Coordinator) deadlineFor(r Reason) time.Duration {
 		return d
 	}
 	return c.gracePeriod
+}
+
+// waited reports the deadline drain applied to each reason the cut saw
+// outstanding: Outcome.Waited, and the only mitigation an open set of string
+// reasons has for its one dangerous failure. Nothing checks that a configured
+// reason is a reason anybody holds, so WithDeadline("harness/pending_gaet", 0)
+// leaves the real pending_gate at the full grace period — a drain that waits
+// hours on a human, which is precisely what the zero deadline was written to
+// prevent. Reporting the applied deadline makes that visible on the first
+// drain rather than never.
+//
+// The map is FRESH, and never c.cfg.deadlines. The config map is held by
+// reference with no defensive copy — deliberately, since every option builds
+// its own — and this map carries reasons nobody configured at the grace period,
+// so building it by adding to the config would rewrite the policy of a
+// coordinator whose sequence is still reading it.
+//
+// The scope is the cut's snapshot: the reasons outstanding when admission
+// closed. A reason acquired and released entirely inside a signal drain's open
+// settle window is therefore absent, which is right rather than a compromise —
+// no deadline was ever applied to it, so there is nothing to report and nothing
+// a typo could have misconfigured. It also keeps the wait phase's records to
+// the one snapshot the cut already produces, instead of tracking every reason
+// seen while draining on Acquire's hot path.
+func (c *Coordinator) waited(cut cutoff) map[Reason]time.Duration {
+	if len(cut.outstanding) == 0 {
+		// nil, never an empty non-nil map, matching Holds and Abandoned: a
+		// caller's m == nil and len(m) == 0 must never disagree.
+		return nil
+	}
+
+	waited := make(map[Reason]time.Duration, len(cut.outstanding))
+	for r := range cut.outstanding {
+		waited[r] = c.deadlineFor(r)
+	}
+	return waited
 }
 
 // abandon is phase 5 for one reason: its deadline has passed, so the owner is
