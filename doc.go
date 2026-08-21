@@ -33,5 +33,11 @@
 // occupancy answers "how full am I", and they are different numbers. The
 // composition root wires drain's state to a readiness probe and a gauge.
 //
+// The error taxonomy is one rule, and it tells a caller which of errors.As and
+// errors.Is to reach for: every failure that carries data is a concrete struct
+// recovered with errors.As (*InvalidPolicyError, *GracePeriodExceededError), and
+// the one failure that carries nothing is a sentinel matched with errors.Is
+// (ErrAlreadyRunning). Never classify a drain error by its message text.
+//
 // The module depends on the Go standard library and nothing else.
 package drain

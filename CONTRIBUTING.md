@@ -31,8 +31,17 @@ repository.
   domain meaning. No untyped magic numbers/strings.
 - **All errors are typed.** Every distinct failure mode that carries data
   is a concrete struct with an `Error()` method (and `Unwrap()` when it
-  carries a cause); the one error with no fields is a sentinel. Callers
-  classify with `errors.As`/`errors.Is` — never by string.
+  carries a cause). **Never return `errors.New(...)`/`fmt.Errorf(...)` from
+  a package-level API** — the single exception is a fieldless failure,
+  which is a package-level sentinel `var` (`ErrAlreadyRunning`) matched by
+  identity, not an error value minted at the return site. Callers classify
+  with `errors.As`/`errors.Is` — never by string.
+  - Settled, so it is not relitigated per PR: a non-nil
+    `InvalidPolicyError.Err` constructed with `errors.New`/`fmt.Errorf` is
+    a **wrapped detail cause carried inside a typed struct**, reached
+    through `Unwrap`. It is not "returning `errors.New` from a
+    package-level API" — the value the API returns is the typed struct —
+    and the rule above permits it.
 - **Contracts first.** Write the interface, then the implementation. Keep
   interfaces small and segregated; a caller never depends on methods it
   does not use.

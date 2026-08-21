@@ -43,9 +43,13 @@ func TestInvalidPolicyErrorUnwrap(t *testing.T) {
 		t.Errorf("Error() = %q, want a %q prefix", msg, "drain: ")
 	}
 	for _, want := range []string{"gracePeriod", "must be positive"} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("Error() = %q, want it to mention %q", msg, want)
-		}
+		t.Run("message mentions "+want, func(t *testing.T) {
+			t.Parallel()
+
+			if !strings.Contains(msg, want) {
+				t.Errorf("Error() = %q, want it to mention %q", msg, want)
+			}
+		})
 	}
 }
 
@@ -70,7 +74,7 @@ func TestGracePeriodExceededError(t *testing.T) {
 	err := &drain.GracePeriodExceededError{
 		Elapsed:   6 * time.Second,
 		Budget:    5 * time.Second,
-		Abandoned: map[drain.Reason]int{"harness/pending_gate": 2},
+		Abandoned: map[drain.Reason]int{"harness/pending_gate": 2, "harness/subprocess": 1},
 	}
 
 	var target *drain.GracePeriodExceededError
@@ -88,21 +92,52 @@ func TestGracePeriodExceededError(t *testing.T) {
 	if !strings.HasPrefix(msg, "drain: ") {
 		t.Errorf("Error() = %q, want a %q prefix", msg, "drain: ")
 	}
-	for _, want := range []string{"6s", "5s"} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("Error() = %q, want it to mention %q", msg, want)
-		}
+	// "3 hold(s)" is the one value in the message that is computed rather than a
+	// field render: Error() sums Abandoned across reasons, so 2 + 1 must not
+	// surface as either input on its own.
+	for _, want := range []string{"6s", "5s", "3 hold(s) abandoned"} {
+		t.Run("message mentions "+want, func(t *testing.T) {
+			t.Parallel()
+
+			if !strings.Contains(msg, want) {
+				t.Errorf("Error() = %q, want it to mention %q", msg, want)
+			}
+		})
 	}
 }
 
-// TestGracePeriodExceededErrorNoAbandoned covers the empty-map boundary: the
-// ceiling can expire with nothing left outstanding.
-func TestGracePeriodExceededErrorNoAbandoned(t *testing.T) {
+// TestGracePeriodExceededErrorAbandonedTotal pins the derived count on its own:
+// the total is a sum over reasons, so a message that echoed a single reason's
+// count would still contain a plausible-looking number.
+func TestGracePeriodExceededErrorAbandonedTotal(t *testing.T) {
 	t.Parallel()
 
-	err := &drain.GracePeriodExceededError{Elapsed: time.Second, Budget: time.Second}
-	if msg := err.Error(); !strings.HasPrefix(msg, "drain: ") {
-		t.Errorf("Error() = %q, want a %q prefix", msg, "drain: ")
+	for _, tc := range []struct {
+		name      string
+		abandoned map[drain.Reason]int
+		want      string
+	}{
+		{"nil map", nil, "0 hold(s) abandoned"},
+		{"empty map", map[drain.Reason]int{}, "0 hold(s) abandoned"},
+		{"one reason", map[drain.Reason]int{"a": 4}, "4 hold(s) abandoned"},
+		{"summed across reasons", map[drain.Reason]int{"a": 4, "b": 3, "c": 1}, "8 hold(s) abandoned"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := &drain.GracePeriodExceededError{
+				Elapsed:   2 * time.Second,
+				Budget:    time.Second,
+				Abandoned: tc.abandoned,
+			}
+			msg := err.Error()
+			if !strings.HasPrefix(msg, "drain: ") {
+				t.Errorf("Error() = %q, want a %q prefix", msg, "drain: ")
+			}
+			if !strings.Contains(msg, tc.want) {
+				t.Errorf("Error() = %q, want it to mention %q", msg, tc.want)
+			}
+		})
 	}
 }
 
@@ -112,8 +147,12 @@ func TestErrAlreadyRunningIsSentinel(t *testing.T) {
 	if drain.ErrAlreadyRunning == nil {
 		t.Fatal("ErrAlreadyRunning is nil")
 	}
-	if !errors.Is(drain.ErrAlreadyRunning, drain.ErrAlreadyRunning) {
-		t.Error("errors.Is(ErrAlreadyRunning, ErrAlreadyRunning) = false, want true")
+	// The property the sentinel actually depends on is that matching is by
+	// identity: an unrelated error carrying the same text must not match, or a
+	// caller's errors.Is would classify someone else's failure as this one.
+	// (errors.Is(x, x) is a language guarantee and proves nothing.)
+	if errors.Is(errors.New("drain: already running"), drain.ErrAlreadyRunning) {
+		t.Error("sentinel must match by identity, never by message text")
 	}
 	if !errors.Is(fmt.Errorf("wait: %w", drain.ErrAlreadyRunning), drain.ErrAlreadyRunning) {
 		t.Error("errors.Is did not match ErrAlreadyRunning through a wrap")

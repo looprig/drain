@@ -6,12 +6,16 @@ import (
 	"time"
 )
 
-// This file defines the drain error taxonomy. Every distinct failure that
-// carries data is a concrete struct with an Error() method, so callers classify
-// with errors.As and never by string; the one failure that carries nothing is a
-// sentinel matched with errors.Is. Every Error() is prefixed "drain: " and names
-// its subject, with string subjects strconv.Quote'd so an untrusted reason
-// cannot inject newlines or control bytes into a log line.
+// This file implements the error taxonomy documented on the package (see
+// doc.go). Two rules govern the messages, and the second is a rule for future
+// code, not a description of current behaviour:
+//
+//   - Every Error() is prefixed "drain: " and names its subject.
+//   - When an Error() renders a string subject — a field name today, a Reason
+//     when one is ever rendered — it quotes it with strconv.Quote, so an
+//     untrusted value cannot inject newlines or control bytes into a log line.
+//     No Error() in this package renders a Reason yet; the rule binds the one
+//     that first does.
 
 // InvalidPolicyError reports a coordinator policy that cannot be honoured. It is
 // returned only by New, which is the single validation point: options record
