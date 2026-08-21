@@ -2,9 +2,12 @@ package drain
 
 import "time"
 
-// Outcome is the telemetry record of one sequence. It is always valid and always
-// returned, including alongside a non-nil error, so a caller that is being
-// killed on a deadline still gets to say what it was waiting for.
+// Outcome is the telemetry record of one sequence. It is always returned, and on
+// every path where a sequence actually ran it is valid and populated —
+// including alongside a non-nil error, so a caller that is being killed on a
+// deadline still gets to say what it was waiting for. The single exception is
+// ErrAlreadyRunning, which yields the zero Outcome because the call it came from
+// ran no sequence.
 type Outcome struct {
 	// Cause is the first cause recorded by Begin.
 	Cause Cause
@@ -35,9 +38,14 @@ type Outcome struct {
 	// rather than whatever the counters said once they had run. Reasons at zero
 	// are omitted.
 	//
-	// Reasons configured with a zero deadline appear here on every drain by
-	// design; Waited[r] == 0 identifies them, and an alert on Abandoned > 0
-	// should exclude them.
+	// A zero-deadline reason is the one most likely to show up here, and it is
+	// not a failure when it does: WithDeadline(r, 0) means "abandon at the cut",
+	// so a hold nobody releases is reported here on every drain it was held
+	// for. It is NOT unconditional — a zero deadline abandons but does not end
+	// the wait, so an owner whose OnDeadline interrupts the work releases the
+	// hold and the reason is absent — but an alert on Abandoned > 0 should
+	// exclude the reasons Waited[r] == 0 identifies, because for those this is
+	// the configured outcome rather than an overrun.
 	//
 	// Abandoned is nil when every count is zero; it is never an empty non-nil
 	// map. When Wait also returns a *GracePeriodExceededError, that error's

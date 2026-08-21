@@ -63,7 +63,11 @@ func WithPreDrainDelay(d time.Duration) Option {
 }
 
 // WithIdleTimeout makes the coordinator Begin(CauseIdle) after d elapses with
-// zero holds outstanding, timed from Wait entry. Default 0, disabled.
+// zero holds outstanding. Default 0, disabled.
+//
+// The window is timed from the moment the total reached zero: Wait entry if
+// nothing was ever held, and otherwise the release of the last hold. Acquiring
+// a hold cancels it, and releasing the last one starts a fresh d.
 //
 // Only enable this where a clean exit is the intended lifecycle: a Job or KEDA
 // ScaledJob, an operator-owned per-session pod, or a systemd/Compose unit that
@@ -100,22 +104,45 @@ func WithDeadline(r Reason, d time.Duration) Option {
 
 // WithOnQuiesce registers a callback that observes the start of the sequence;
 // use it to fail a readiness probe. It runs once, on a coordinator-owned
-// goroutine, inside the grace ceiling.
+// goroutine.
+//
+// It is neither waited for nor cancelled. The ceiling covers it only in the
+// sense that a wedged OnQuiesce cannot stop Wait from returning — Wait's exit
+// condition deliberately excludes it, because admission is already closed by
+// the time it could matter and a process with nothing outstanding must not be
+// held for the full grace period by a callback whose only job was to stop
+// traffic that is already being refused. A callback that never returns leaks
+// its goroutine into a process that is exiting anyway. It takes no ctx for the
+// same reason: there is nothing useful to cancel. If the sequence began with
+// the budget already spent — a signal that arrived while the process was still
+// starting up — the ceiling has expired before this callback is even started.
 func WithOnQuiesce(fn func(cause Cause)) Option {
 	return func(cfg *config) { cfg.onQuiesce = fn }
 }
 
-// WithOnDeadline registers a callback invoked once per reason whose deadline
-// expired with holds still outstanding, on coordinator-owned goroutines,
-// possibly concurrently for different reasons. ctx expires at the grace ceiling.
+// WithOnDeadline registers a callback invoked at most once per reason, on
+// coordinator-owned goroutines, possibly concurrently for different reasons.
+// ctx expires at the grace ceiling.
 //
-// Read context.Cause(ctx), not ctx.Err(), to tell the two endings apart. The
-// ceiling is driven by the injected Clock rather than by context.WithDeadline,
-// so Err() is context.Canceled whichever way the sequence ended; the cause is
-// context.DeadlineExceeded when the grace ceiling expired, and Wait's own ctx's
-// cause when the drain was called off from outside. On that second path the ctx
-// is already done at the invocation — the call is a notification that
-// abandonment happened, not a budget to work within.
+// Two things reach it, and only the first is a deadline. A reason whose own
+// deadline expires with holds still outstanding gets its report there. Then,
+// if the sequence ends any way other than cleanly — the ceiling expired, or
+// Wait's ctx was cancelled — every reason still outstanding that has not
+// already had a report gets one, whether or not its deadline was anywhere near.
+// A cancelled drain abandons work exactly as an overrun does and the owner is
+// owed the same notice; the alternative is a process that walks away from
+// in-flight work silently.
+//
+// Read context.Cause(ctx), not ctx.Err(), to tell the endings apart. The ceiling
+// is driven by the injected Clock rather than by context.WithDeadline, so Err()
+// does not distinguish them: it is context.Canceled when the ceiling expired and
+// when a plain cancellation ended the drain, and — because the callback ctx is
+// derived from Wait's — it is whatever the parent reports when the parent was
+// itself a deadline. The cause is context.DeadlineExceeded when the grace
+// ceiling expired, and Wait's own ctx's cause when the drain was called off from
+// outside. On that second path the ctx is already done at the invocation — the
+// call is a notification that abandonment happened, not a budget to work
+// within.
 //
 // It returns nothing: the callback cannot extend the wait, because the ceiling
 // exists precisely because SIGKILL does not negotiate. A legitimate need for

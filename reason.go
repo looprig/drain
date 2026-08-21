@@ -14,16 +14,24 @@ package drain
 //   - Typos fail in the dangerous direction. WithDeadline("pending_gaet", 0)
 //     silently leaves the real pending_gate at the full grace period — a drain
 //     that waits hours on a human, which is the exact failure a zero deadline
-//     exists to prevent. Outcome.Waited is the mitigation: it reports the
-//     deadline actually applied to every reason seen, so the misconfiguration is
-//     visible in telemetry on the first drain instead of never.
+//     exists to prevent. Outcome.Waited is the mitigation, within its limits:
+//     it reports the deadline actually applied to each reason outstanding when
+//     admission closed, so the real pending_gate shows up there at the full
+//     grace period instead of the zero that was intended. The typo itself is
+//     invisible — a reason nobody holds has no entry — so what telemetry
+//     surfaces is the reason that WASN'T configured, not the string that was
+//     misspelled.
 //   - Two subsystems sharing one coordinator can silently share a counter.
 //     Prefix reason strings with the owning package or module by convention
 //     ("harness/pending_gate").
 //
 // Reasons are a low-cardinality static vocabulary. Never derive one from a
-// per-session identifier ("session-<uuid>"): the counter map is keyed by reason
-// and would grow unboundedly.
+// per-session identifier ("session-<uuid>"). The counter map deletes a reason
+// when its count reaches zero, so the cost is not an unbounded map; it is that
+// every per-reason mechanism becomes per-session. WithDeadline can no longer
+// name a reason, so every derived reason silently takes the full grace period;
+// Outcome.Waited and Outcome.Abandoned become unbounded cardinality in whatever
+// consumes them; and the deadline sweep arms one timer per live session.
 type Reason string
 
 // ReasonUnspecified is the zero Reason — a hold whose class the caller never

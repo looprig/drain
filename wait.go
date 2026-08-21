@@ -43,12 +43,19 @@ const (
 
 // Wait arms the idle timer and blocks until the sequence completes or ctx is
 // done. It installs no signal handling; use Run for that, or call Begin from
-// your own handler. The idle clock's epoch is Wait entry, not New.
+// your own handler.
+//
+// The idle clock's first epoch is Wait entry, not New. It is not the only
+// epoch: the timer is re-armed on every transition of the total back to zero,
+// so an idle drain fires IdleTimeout after the last hold was released rather
+// than IdleTimeout after Wait was entered.
 //
 // Wait may be called once. A second call, concurrent or after return, yields
-// ErrAlreadyRunning. Outcome is always valid, including alongside
-// *GracePeriodExceededError or ctx.Err(). After Wait returns the coordinator is
-// permanently spent: Acquire refuses forever and Wait errors forever.
+// ErrAlreadyRunning and the ZERO Outcome — there was no sequence for it to
+// report on. On every other path Outcome is valid and populated, including
+// alongside *GracePeriodExceededError or ctx.Err(). After Wait returns the
+// coordinator is permanently spent: Acquire refuses forever and Wait errors
+// forever.
 func (c *Coordinator) Wait(ctx context.Context) (Outcome, error) {
 	if !c.claim() {
 		return Outcome{}, ErrAlreadyRunning

@@ -16,9 +16,10 @@
 // then acquiring is a TOCTOU race.
 //
 // There are two entry points, and which one is right is decided by who owns the
-// process's signals. Run installs handling for SIGTERM and SIGINT, begins the
-// sequence when one arrives, and then restores their default disposition so a
-// second signal kills a wedged drain; it is for the process that has no signal
+// process's signals. Run installs handling for SIGTERM and SIGINT; on the first
+// one it restores their default disposition and then begins the sequence, in
+// that order, so that a second signal kills a wedged drain rather than landing
+// in a buffer nobody is reading. It is for the process that has no signal
 // handling of its own. Wait installs NOTHING. signal.Notify is additive and
 // process-wide, so a library that quietly registers for SIGINT changes the
 // behaviour of every program that links it — an embedder that already owns its
@@ -49,7 +50,11 @@
 // errors.Is to reach for: every failure that carries data is a concrete struct
 // recovered with errors.As (*InvalidPolicyError, *GracePeriodExceededError), and
 // the one failure that carries nothing is a sentinel matched with errors.Is
-// (ErrAlreadyRunning). Never classify a drain error by its message text.
+// (ErrAlreadyRunning). The one error drain does not mint is the one it did not
+// cause: Wait returns its own ctx's Err verbatim when the drain was called off
+// from outside, so a caller matching with errors.Is should expect
+// context.Canceled and context.DeadlineExceeded too. Never classify a drain
+// error by its message text.
 //
 // The module depends on the Go standard library and nothing else.
 package drain

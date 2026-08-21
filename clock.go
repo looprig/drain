@@ -16,14 +16,17 @@ type Clock interface {
 	// that can cancel it. A non-positive d is due immediately.
 	//
 	// An implementation MUST NOT invoke f while holding a lock that AfterFunc,
-	// Stop, or Now also acquires. The coordinator calls all three from inside
-	// callbacks — the idle callback re-arms, the settle callback reads the
-	// counters, the ceiling callback cancels — and it calls AfterFunc and Stop
-	// while holding its own mutex, so the module's only lock order is
-	// coordinator then clock, with no reverse edge. A Clock that ran f under
-	// its own lock would close that cycle and deadlock the coordinator on the
-	// first hold transition, with nothing in the resulting goroutine dump to
-	// name the implementation as the cause.
+	// Stop, or Now also acquires. Two facts about the coordinator close the
+	// cycle between them. It calls AfterFunc and Stop while holding its own
+	// mutex — arming the idle timer under the lock is what keeps the generation
+	// it captures the one that was current when the total reached zero — and it
+	// calls Now from INSIDE a timer callback, where it also takes that mutex:
+	// the idle callback re-validates and calls Begin as one critical section,
+	// and Begin reads the clock. So the module's only lock order is coordinator
+	// then clock, with no reverse edge. A Clock that ran f under its own lock
+	// would supply the reverse edge and deadlock the coordinator on the first
+	// hold transition, with nothing in the resulting goroutine dump to name the
+	// implementation as the cause.
 	//
 	// How an implementation satisfies that is its own business: time.AfterFunc
 	// runs f on a new goroutine, and draintest runs it on the goroutine that
