@@ -79,6 +79,14 @@ func WithIdleTimeout(d time.Duration) Option {
 // abandon immediately — correct for a hold that waits on a human, and a trap for
 // an unset config field.
 //
+// An unconfigured reason's report is not actionable. Its deadline IS the grace
+// period, so "still outstanding at its deadline" and "overran the ceiling" are
+// the same instant: OnDeadline fires with a callback context already cancelled,
+// on a goroutine nobody waits for, in the same instant Wait returns. Configure
+// any reason whose abandonment you intend to act on. The full-grace default is
+// the cautious one — it never abandons work early — but it buys caution, not a
+// working interrupt hook.
+//
 // The last WithDeadline for a reason wins, so a composition root can layer a
 // caller's options over its own defaults.
 func WithDeadline(r Reason, d time.Duration) Option {
@@ -114,6 +122,14 @@ func WithOnQuiesce(fn func(cause Cause)) Option {
 // more time is already spelled WithDeadline(r, longer). outstanding is a
 // snapshot taken under the lock at invocation and is advisory — releases race
 // with it by design.
+//
+// Bounding the whole shutdown with context.WithTimeout collapses the ceiling
+// and parent discrimination above, and it collapses it for the callback only:
+// endingCause forwards context.DeadlineExceeded either way, so a callback can no
+// longer tell "the grace ceiling expired" from "the caller's own timeout fired".
+// Wait's return still distinguishes them — a ceiling overrun is
+// *GracePeriodExceededError and a cancelled parent is ctx.Err() — so put the
+// logic that needs to know which happened after Wait, not inside OnDeadline.
 func WithOnDeadline(fn func(ctx context.Context, r Reason, outstanding int)) Option {
 	return func(cfg *config) { cfg.onDeadline = fn }
 }
@@ -124,6 +140,12 @@ func WithOnDeadline(fn func(ctx context.Context, r Reason, outstanding int)) Opt
 //
 // The set is replaced, not extended, and it is copied, so a caller that reuses
 // its slice cannot alter a constructed coordinator's policy.
+//
+// WithSignals() with no arguments installs no handler at all, and Run is then
+// exactly Wait. That is not the degenerate reading: an empty set is a set, and
+// signal.Notify documents it as EVERY signal — so the literal reading would
+// turn an empty WithSignals into a drain begun by SIGWINCH, by SIGCHLD, and by
+// the profiler's SIGPROF. A caller who configured no signals wanted no signals.
 func WithSignals(sigs ...os.Signal) Option {
 	return func(cfg *config) { cfg.signals = slices.Clone(sigs) }
 }

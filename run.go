@@ -55,9 +55,9 @@ func (c *Coordinator) Run(ctx context.Context) (Outcome, error) {
 // The watcher goroutine, rather than a handler calling Begin inline, is what
 // the signal package's own contract asks for: delivery is a send on a channel,
 // so something has to be receiving. It is also what keeps the escalation honest
-// — the deferred stopSignals runs the moment the first signal has been turned
-// into a Begin, not when the drain eventually ends, and a drain that has wedged
-// is exactly the case where the difference matters.
+// — stopSignals runs the moment the first signal is received, before Begin and
+// long before the drain ends, and a drain that has wedged is exactly the case
+// where the difference matters.
 //
 // The teardown waits for that goroutine to exit. Run therefore leaves nothing
 // running behind it, which matters twice: a process that goes on to do
@@ -85,20 +85,28 @@ func (c *Coordinator) installSignals() func() {
 	exited := make(chan struct{})
 	go func() {
 		defer close(exited)
-		// Restoring the default disposition is one line for both exits, and it
-		// has to be: after the first signal it is the escalation the operator
-		// relies on, and on the teardown path it is the registration this
-		// process should not keep. Doing it here rather than in the teardown is
-		// what makes the first of those prompt.
-		defer stopSignals(received)
 
+		// Both exits restore the default disposition, and neither does it with
+		// a defer. A deferred restore on the signal path would run after Begin
+		// returns, and Begin takes c.mu and reads the clock — so a second
+		// signal arriving in that window lands in the now-drained one-slot
+		// buffer and is silently swallowed. The operator's escalation against a
+		// wedged drain is precisely a second Ctrl-C, and the window a defer
+		// opens is precisely the moment a first Ctrl-C makes them press it
+		// again. Restoring first makes that window as small as the runtime
+		// allows: after this line the kernel, not this process, decides.
 		select {
 		case <-received:
+			stopSignals(received)
+
 			// Begin, and nothing more. The sequence runs inside Wait, on Wait's
 			// goroutine, because this one is a signal watcher and a signal
 			// watcher is not a place to spend a grace period.
 			c.Begin(CauseSignal)
 		case <-done:
+			// The teardown path: no signal ever arrived, and this is the
+			// process-wide registration Run promises not to leave behind.
+			stopSignals(received)
 		}
 	}()
 

@@ -32,6 +32,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"os/signal"
 	"reflect"
 	"slices"
 	"strconv"
@@ -361,6 +362,40 @@ func TestRunIsWaitPlusSignals(t *testing.T) {
 	if got := seam.stop(t); got != ch {
 		t.Errorf("signal.Stop(%v), want the channel signal.Notify was given, %v: "+
 			"Run leaves no handler behind", got, ch)
+	}
+}
+
+// TestSeamDefaultsAreTheSignalPackage pins what the seam in run.go defaults to.
+//
+// Every other test in this file replaces notifySignals and stopSignals and then
+// asserts on what Run did to the replacements. That establishes what Run calls;
+// it establishes nothing about what those variables call when nobody has
+// replaced them. Swap either default for a no-op and the entire suite stays
+// green while the shipped binary installs no handler, or — worse, because it
+// fails only in production and only under an operator's second Ctrl-C — never
+// restores the default disposition, so a wedged drain becomes unkillable by
+// anything short of SIGKILL.
+//
+// Function values are compared by code pointer because functions are not
+// comparable in Go; reflect.Value.Pointer is the documented way to ask whether
+// two func values refer to the same code.
+func TestSeamDefaultsAreTheSignalPackage(t *testing.T) {
+	// Named so a failure says which half of the escalation contract broke.
+	seams := []struct {
+		name string
+		got  any
+		want any
+		why  string
+	}{
+		{"notifySignals", notifySignals, signal.Notify,
+			"Run must register for the configured signals, or SIGTERM keeps its default disposition and kills the process undrained"},
+		{"stopSignals", stopSignals, signal.Stop,
+			"Run must restore the default disposition after the first signal, or a second Ctrl-C cannot kill a wedged drain"},
+	}
+	for _, seam := range seams {
+		if got, want := reflect.ValueOf(seam.got).Pointer(), reflect.ValueOf(seam.want).Pointer(); got != want {
+			t.Errorf("%s does not default to the os/signal function: %s", seam.name, seam.why)
+		}
 	}
 }
 

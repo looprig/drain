@@ -118,8 +118,14 @@ func (c *Coordinator) Wait(ctx context.Context) (Outcome, error) {
 	// Abandoned is what is still outstanding, snapshotted ONCE and snapshotted
 	// HERE, before phase 5's sweep dispatches anything. Every hold that reached
 	// a boundary has released by now, so what remains is exactly the work the
-	// process is walking away from — and it is exactly what the sweep below is
-	// about to be told about, which is the property the ordering buys.
+	// process is walking away from.
+	//
+	// The sweep below is handed THIS map rather than re-reading the counters,
+	// and that is what makes "every reason in Abandoned got a callback" true
+	// rather than merely likely. Two acquisitions of c.mu are two answers: a
+	// release landing between them drops a reason out of the second read, and
+	// the operator is then handed an Abandoned naming work nothing was ever
+	// told to abandon. One snapshot, two uses, no window.
 	//
 	// Reading the counters after the sweep would make the number depend on a
 	// goroutine race. The expected shape of abandonment is an owner whose
@@ -135,7 +141,7 @@ func (c *Coordinator) Wait(ctx context.Context) (Outcome, error) {
 
 	if how != endedComplete {
 		cancelCallbacks(endingCause(how, ctx))
-		c.abandonRemaining(callbackCtx)
+		c.abandonRemaining(callbackCtx, abandoned)
 	}
 
 	out := Outcome{
@@ -585,23 +591,28 @@ func (c *Coordinator) abandon(ctx context.Context, r Reason) {
 // abandonRemaining is phase 5 at the ceiling: every reason still outstanding
 // that has not already had its report gets one, and Wait does not wait for them.
 //
+// outstanding is the caller's snapshot — the same map Wait is about to return as
+// Outcome.Abandoned — rather than a fresh read of the counters. Re-reading here
+// would put a second acquisition of c.mu between the snapshot and the sweep, and
+// a release landing in that window yields a reason the caller is told was
+// abandoned and whose owner was never told to abandon it. That disagreement is
+// the one thing the single-snapshot ordering exists to rule out.
+//
+// A reason that released between the snapshot and now is not a problem: abandon
+// re-reads the count under the lock and dispatches nothing for a reason that has
+// reached zero, so the extra names in the snapshot cost a lock acquisition, not
+// a spurious callback.
+//
 // Reasons are visited in sorted order for the same reason armDeadlines visits
 // them sorted — a map's order would make which of two simultaneous reports is
 // dispatched first differ run to run.
-func (c *Coordinator) abandonRemaining(ctx context.Context) {
+func (c *Coordinator) abandonRemaining(ctx context.Context, outstanding map[Reason]int) {
 	if c.cfg.onDeadline == nil {
 		return
 	}
-	for _, r := range c.outstandingReasons() {
+	for _, r := range slices.Sorted(maps.Keys(outstanding)) {
 		c.abandon(ctx, r)
 	}
-}
-
-// outstandingReasons lists the reasons with holds outstanding right now, sorted.
-func (c *Coordinator) outstandingReasons() []Reason {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return slices.Sorted(maps.Keys(c.holds))
 }
 
 // claimAbandon decides, under the lock, whether reason r gets a report now, and

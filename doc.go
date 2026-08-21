@@ -15,6 +15,18 @@
 // busy". Acquire's ok is the sole admission authority — checking Draining and
 // then acquiring is a TOCTOU race.
 //
+// There are two entry points, and which one is right is decided by who owns the
+// process's signals. Run installs handling for SIGTERM and SIGINT, begins the
+// sequence when one arrives, and then restores their default disposition so a
+// second signal kills a wedged drain; it is for the process that has no signal
+// handling of its own. Wait installs NOTHING. signal.Notify is additive and
+// process-wide, so a library that quietly registers for SIGINT changes the
+// behaviour of every program that links it — an embedder that already owns its
+// signals, such as a TUI that intercepts Ctrl-C for its own UX, keeps its
+// handler and calls Begin from it. Both run the same sequence and return the
+// same Outcome; a coordinator is spent after either, and a second call is
+// ErrAlreadyRunning.
+//
 // Idle self-termination is the same machinery with a different cause, and it is
 // correct in far fewer places than it looks. Self-exit is not how scale-to-zero
 // works: Deployments and StatefulSets require restartPolicy Always, and the
