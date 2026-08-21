@@ -21,10 +21,12 @@ package drain_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/looprig/drain"
+	"github.com/looprig/drain/draintest"
 )
 
 // hungCallback returns a callback body that never returns on its own, a channel
@@ -424,6 +426,126 @@ func TestOnDeadlineFiresOnceWhenDeadlineEqualsCeiling(t *testing.T) {
 
 		rec.next(reasonTurn, 1)
 		rec.none("the deadline timer and the ceiling sweep are the same instant, and one report is owed")
+		if got := out.Abandoned[reasonTurn]; got != 1 {
+			t.Errorf("Outcome.Abandoned = %v, want %d hold of %q", out.Abandoned, 1, reasonTurn)
+		}
+	})
+}
+
+// deadlineArm is the arming ordinal of the per-reason deadline timer in the
+// sequence deadTimerClock is used against: the grace ceiling is armed first, at
+// quiesce; the settle window second; and the wait phase's one deadline third.
+// An idle timeout would arm ahead of all three, so the rig below sets none.
+const deadlineArm = 3
+
+// deadTimerClock is a drain.Clock that swallows exactly one arm. The nth
+// AfterFunc it sees is not armed on the underlying clock at all: the callback is
+// dropped, and the caller is handed a timer that never fires and reports a
+// successful Stop.
+//
+// It exists to remove a mechanism rather than to simulate one. A test that wants
+// to know which of two paths produced an effect cannot find out by advancing a
+// clock both of them are racing on, and "advance and see which one won" is a
+// property of the scheduler rather than of the coordinator.
+//
+// Stop returns true because that is the honest answer for a timer that has not
+// fired, and because the coordinator ignores it: stopping a deadline that never
+// came due is tidiness, and every decision the sequence makes about a deadline
+// is made by the callback or by the ceiling, never by a Stop return.
+type deadTimerClock struct {
+	clock   *draintest.Clock
+	swallow int // the 1-based arming ordinal to drop
+
+	mu   sync.Mutex
+	arms int
+}
+
+// Now is the underlying clock's, unchanged: only arming is decorated.
+func (c *deadTimerClock) Now() time.Time { return c.clock.Now() }
+
+// AfterFunc arms every timer but the swallowed one on the underlying clock.
+//
+// The counter is guarded because the coordinator arms from more than one
+// goroutine — Wait's own, and the settle timer's callback, which runs on
+// whichever goroutine advanced the clock — so an unsynchronized count would be a
+// data race the -race build reports before the test ever asserts anything.
+func (c *deadTimerClock) AfterFunc(d time.Duration, f func()) drain.Timer {
+	c.mu.Lock()
+	c.arms++
+	swallowed := c.arms == c.swallow
+	c.mu.Unlock()
+
+	if swallowed {
+		return deadTimer{}
+	}
+	return c.clock.AfterFunc(d, f)
+}
+
+// deadTimer is the timer a swallowed arm returns.
+type deadTimer struct{}
+
+// Stop reports the cancellation of a callback that was never going to run.
+func (deadTimer) Stop() bool { return true }
+
+// TestCeilingSweepReportsAReasonWhoseDeadlineNeverFired is the deterministic
+// half of the collision TestOnDeadlineFiresOnceWhenDeadlineEqualsCeiling covers
+// from the other side. That test proves the two paths do not both report; this
+// one proves the ceiling's sweep is a path at all.
+//
+// The distinction matters because an unconfigured reason's deadline timer and
+// the ceiling are armed for the SAME INSTANT, so with both mechanisms present
+// either can produce the report and the suite passes on whichever wins. Deleting
+// abandonRemaining is then caught only in the fraction of runs where the ceiling
+// happened to win — and caught as a callback nobody ever makes, which inside a
+// bubble is a deadlock panic that takes the whole test binary with it, exactly
+// the shape a maintainer triages as flaky infrastructure.
+//
+// So the deadline timer is removed rather than raced: the clock swallows that
+// one arm, the ceiling is driven as usual, and the report that arrives can only
+// have come from the sweep. Deleting the sweep fails this test at -count=1.
+func TestCeilingSweepReportsAReasonWhoseDeadlineNeverFired(t *testing.T) {
+	t.Parallel()
+
+	bubbled(t, func(t *testing.T, ctx context.Context) {
+		rec := newRecorder(t)
+		r := newRigWithPolicy(t, rigPolicy{
+			grace:  testGrace,
+			settle: testSettle,
+			wrapClock: func(clock *draintest.Clock) drain.Clock {
+				return &deadTimerClock{clock: clock, swallow: deadlineArm}
+			},
+		}, drain.WithOnDeadline(rec.on))
+
+		r.start(ctx)
+		r.Begin(drain.CauseSignal)
+
+		// Unconfigured, so its deadline is the grace period — which is what
+		// makes the deadline timer and the ceiling collide in the first place.
+		turn := r.mustAcquire(reasonTurn)
+		defer turn()
+		r.closeSettleWindow()
+
+		// The wait phase is ordered against through the bubble rather than
+		// through reach, because the arm reach would block on is the one this
+		// clock swallows: armedIn(phaseWait) would be the grace ceiling alone,
+		// which is armed already, so reach would return before the coordinator
+		// had entered the wait phase at all. That is not a cosmetic difference.
+		// A wait phase entered AFTER the ceiling has expired finds every
+		// remainder non-positive and dispatches its report straight out of
+		// armDeadlines, so the sweep would not be the path taken and the test
+		// would silently stop testing it. stillDraining returns only once
+		// Wait's goroutine is durably blocked, which it can only be once the
+		// deadline this clock swallowed has been armed.
+		r.stillDraining("the swallowed deadline can never fire, so only the ceiling can end this drain")
+		r.clock.Advance(testGrace - testSettle)
+		out, _ := r.exceeded(drain.CauseSignal)
+
+		// saw, not next: the sweep dispatches before Wait returns, so the
+		// report is owed by the time there is anything to assert. A blocking
+		// receive would turn its absence — the mutation this test exists to
+		// catch — into the bubble deadlock the test was written to replace.
+		rec.saw(reasonTurn, 1, "the ceiling's sweep is the only path left to report this reason")
+		rec.none("the sweep owes one report per outstanding reason, and this reason had one")
 		if got := out.Abandoned[reasonTurn]; got != 1 {
 			t.Errorf("Outcome.Abandoned = %v, want %d hold of %q", out.Abandoned, 1, reasonTurn)
 		}

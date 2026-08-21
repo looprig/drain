@@ -60,12 +60,12 @@ func (c *Coordinator) Wait(ctx context.Context) (Outcome, error) {
 	// self-kill loop. See idle.go.
 	c.startIdle()
 
-	// Phase 1, quiesce. The sequence is started by Begin, from wherever the
-	// process decides to drain — a signal handler, the idle timer, a shutdown
-	// path — and it runs here, on Wait's goroutine, because none of those is a
-	// place to spend a grace period. A cancelled ctx is itself a Begin: the
-	// process must never be left running with a coordinator that has silently
-	// stopped.
+	// Before phase 1: block until something starts the sequence. Begin is
+	// called from wherever the process decides to drain — a signal handler, the
+	// idle timer, a shutdown path — and the sequence itself runs here, on
+	// Wait's goroutine, because none of those is a place to spend a grace
+	// period. A cancelled ctx is itself a Begin: the process must never be left
+	// running with a coordinator that has silently stopped.
 	select {
 	case <-c.begun:
 	case <-ctx.Done():
@@ -407,12 +407,19 @@ func (c *Coordinator) awaitHolds(ctx, callbackCtx context.Context, ceiling <-cha
 	stop := c.armDeadlines(callbackCtx, cut, beganAt)
 	defer stop()
 
-	// Completion is preferred over the ceiling when both are ready, which is a
-	// statement about determinism rather than about generosity: a drain whose
-	// last hold released at the same instant the ceiling expired either
-	// succeeded or overran depending on how a select shuffled its cases, and a
+	// Completion is preferred over the ceiling when the drain is ALREADY
+	// settled on entry, which is the whole of what this non-blocking select
+	// buys and the whole of what it claims. A drain whose last hold released
+	// before the wait phase was entered would otherwise be reported as a
+	// success or an overrun according to how the select below shuffled two
+	// cases that were both ready on arrival — two answers for one drain, and a
 	// process reports Abandoned to a dashboard. Nothing is outstanding on this
 	// branch, so preferring it costs no wait at all.
+	//
+	// It is not a general tie-break. Two conditions that become ready while the
+	// select below is blocked are still chosen between at random, and no
+	// arrangement of selects can change that; this makes deterministic the one
+	// case that can be made deterministic.
 	select {
 	case <-cut.settled:
 		return endedComplete

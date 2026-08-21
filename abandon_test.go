@@ -66,6 +66,36 @@ func (rec *recorder) next(reason Reason, outstanding int) {
 	}
 }
 
+// saw asserts that an invocation has ALREADY been made, and never blocks. It is
+// next for the case where the report is owed by something that has finished: a
+// missing one is then a fact the test can assert rather than a call it can wait
+// for.
+//
+// The distinction is worth a second method because of how the two fail. next
+// blocks, so a report that is never made hangs the goroutine, and inside a
+// bubble a hung goroutine is a deadlock panic that aborts the whole test binary
+// — every other result in the package lost to one missing callback, and a
+// failure that reads like broken infrastructure rather than like a broken
+// coordinator. Where the wait is not needed, do not take it.
+//
+// Sound only inside a bubble, for the same reason none is: synctest.Wait is
+// what makes "has already been made" a decidable question about a callback
+// dispatched on a goroutine of its own.
+func (rec *recorder) saw(reason Reason, outstanding int, why string) {
+	rec.t.Helper()
+
+	synctest.Wait()
+	select {
+	case got := <-rec.calls:
+		if got.reason != reason || got.outstanding != outstanding {
+			rec.t.Errorf("OnDeadline(%q, %d), want OnDeadline(%q, %d): %s",
+				got.reason, got.outstanding, reason, outstanding, why)
+		}
+	default:
+		rec.t.Fatalf("OnDeadline never fired, want OnDeadline(%q, %d): %s", reason, outstanding, why)
+	}
+}
+
 // took blocks for n invocations and returns them keyed by reason, failing if
 // any reason is reported twice.
 //

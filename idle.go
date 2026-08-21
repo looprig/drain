@@ -22,11 +22,23 @@ package drain
 // generation still matches before it starts anything. Stop remains an
 // optimization — it saves a wakeup — and is never the correctness mechanism.
 //
-// Two checks rather than one, because they catch different things. "Total is
-// still zero" catches a hold that is outstanding right now. "Generation still
-// matches" catches a hold that was acquired and released again while this timer
-// was in flight, which leaves the total at zero and the process anything but
-// idle. Neither implies the other.
+// The callback checks two things, and only one of them is the mechanism. The
+// GENERATION clause is the correctness check: it catches any hold acquired
+// while this timer was in flight, whether or not that hold has since been
+// released, which is exactly the case a count cannot see.
+//
+// The total clause is redundant by construction. armIdleLocked arms only when
+// the total is zero, capturing the generation G current at that instant; any
+// later Acquire from zero bumps the counter to G+1; and a monotone uint64 never
+// returns to G. So a nonzero total implies a changed generation, and the
+// generation check subsumes it. It is kept as defence in depth against a future
+// second increment path that forgets to bump the generation, and because a
+// callback that is about to kill the process is worth making re-read the state
+// it decides on.
+//
+// That is a mutation result rather than an argument: dropping the total clause
+// leaves the whole suite passing at -count=30, while dropping the generation
+// clause fails deterministically at -count=1.
 //
 // The visible consequence, and the property to reach for when this is being
 // changed: a lost idle race followed by a real SIGTERM yields

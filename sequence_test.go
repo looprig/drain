@@ -159,6 +159,21 @@ type rigPolicy struct {
 	// in clock time that a caller may hold up against a wall-clock deadline of
 	// its own.
 	start time.Time
+
+	// wrapClock decorates the rig's clock before the coordinator is given it,
+	// for the one kind of test that cannot be written against the fake alone: a
+	// test that must stop a specific timer from ever firing, to prove which of
+	// two mechanisms produced an effect. It goes through the policy rather than
+	// through opts for the same reason WithClock does — the rig owns the clock,
+	// because a coordinator reading a clock the rig does not drive turns every
+	// reach in the suite into a permanent block.
+	//
+	// A decorator that swallows an arm moves the count reach orders against, so
+	// a test that uses one must declare the difference through armsInWait or
+	// armsIdle. That is deliberate: the count stays a single declared number
+	// rather than something armedIn tries to infer from a function it cannot
+	// see inside.
+	wrapClock func(*draintest.Clock) drain.Clock
 }
 
 // newRig builds a coordinator on a deterministic clock with the standard policy.
@@ -190,10 +205,14 @@ func newRigWithPolicy(t *testing.T, policy rigPolicy, opts ...drain.Option) *rig
 		policy.start = epoch
 	}
 	clock := draintest.NewClock(policy.start)
+	var injected drain.Clock = clock
+	if policy.wrapClock != nil {
+		injected = policy.wrapClock(clock)
+	}
 	all := make([]drain.Option, 0, len(opts)+3)
 	all = append(all, opts...)
 	all = append(all,
-		drain.WithClock(clock),
+		drain.WithClock(injected),
 		drain.WithPreDrainDelay(policy.settle),
 		drain.WithIdleTimeout(policy.idle),
 	)
@@ -290,6 +309,21 @@ func (r *rig) start(ctx context.Context) {
 // reach blocks until the coordinator has armed every timer it arms in p. It is
 // the first of the plan's three rules — order the arm before the advance — and
 // the reason no test in this suite writes BlockUntil itself.
+//
+// A phase whose count is zero orders NOTHING: BlockUntil(0) returns at once and
+// the equality check below trivially holds. That is reach(phaseIdle) on a rig
+// that has said armsIdle(0) — the startup-hold pattern, where no idle timer is
+// armed because there has been no nonzero-to-zero transition yet — and it is
+// correct there precisely because there is no arm to order against.
+//
+// The equality check rests on an invariant of this suite rather than of the
+// coordinator: no timer arms or disarms concurrently with it. Every timer but
+// the idle one belongs to a phase the rig is ordering against, and the idle
+// timer — the one timer that arms and disarms repeatedly within a test — moves
+// only inside Acquire and release, both of which this suite calls
+// synchronously on the test's own goroutine. A test that took or dropped a
+// hold from a goroutine of its own would break that and should order the
+// arming itself.
 func (r *rig) reach(p phase) {
 	r.t.Helper()
 
