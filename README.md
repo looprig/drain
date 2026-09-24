@@ -26,6 +26,20 @@ deliberately not here — a hold answers "can I exit", which is a different numb
 
 This module has **zero third-party dependencies** and will keep it that way.
 
+## Status and install
+
+Released and tagged; it is a tier-0 leaf of the Looprig workspace that depends only on the
+Go standard library. No other Looprig module requires it yet.
+
+```bash
+go get github.com/looprig/drain@latest
+```
+
+| Package | Purpose |
+|---|---|
+| `github.com/looprig/drain` | `Coordinator`, holds (`Acquire`), `Begin`/`Wait`/`Run`, `Outcome`, policy options |
+| `github.com/looprig/drain/draintest` | A manually advanced `Clock` for testing shutdown wiring without real sleeps |
+
 ## Two triggers, one sequence
 
 A drain starts either because something outside told the process to stop, or because the
@@ -117,4 +131,11 @@ GOWORK=off make check
 ```
 
 `GOWORK=off` is mandatory: it is how a module in this workspace is verified against its
-real pinned dependencies. `drain` has none, which is the point.
+real pinned dependencies. `drain` has none, which is the point. The Go baseline is 1.26.8.
+
+`make check` runs `fmt-check`, `vet`, staticcheck, gosec, govulncheck, the tests and the
+build; `make secure` runs the same gates without the tests and build.
+
+## License
+
+Apache License 2.0; see [`LICENSE`](LICENSE).
