@@ -131,7 +131,7 @@ GOWORK=off make check
 ```
 
 `GOWORK=off` is mandatory: it is how a module in this workspace is verified against its
-real pinned dependencies. `drain` has none, which is the point. The Go baseline is 1.26.8.
+real pinned dependencies. `drain` has none, which is the point. The Go baseline is 1.26.9.
 
 `make check` runs `fmt-check`, `vet`, staticcheck, gosec, govulncheck, the tests and the
 build; `make secure` runs the same gates without the tests and build.
